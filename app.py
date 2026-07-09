@@ -2,7 +2,7 @@ import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.styles import PatternFill
 import fiona
 import io
 import datetime
@@ -30,22 +30,16 @@ uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
 MIN_GOAL, MAX_GOAL = [int(x) for x in goal_range.split("-")]
 
 # --- 2. DATA LOADING & CACHING ---
-# We use @st.cache_data so the web server only reads the massive shapefile ONCE per session.
 @st.cache_data
 def load_county_data(county_name):
     if county_name == "Milwaukee":
-        # Relative path inside your GitHub repo
         file_path = "zip://data/Milwaukee_Datapoints07072026.zip"
-        
         try:
             gdf = gpd.read_file(file_path)
-            
-            # Filter out un-preachable addresses based on your specific criteria
             invalid_statuses = [
                 'Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility',
                 'Undeveloped Outlot', 'Sliver or Remnant', 'Non Addressable Assoc with Adj Parcel'
             ]
-            # Keep rows where 'Addr_Statu' is NOT in the invalid list
             gdf = gdf[~gdf['Addr_Statu'].isin(invalid_statuses)]
             return gdf
         except Exception as e:
@@ -55,10 +49,7 @@ def load_county_data(county_name):
 
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
-    # Setup BytesIO buffer to hold the excel file in memory
     output = io.BytesIO()
-    
-    # Pre-calculate counts and categories
     counts_df = joined_gdf.groupby('Territory_Name').size().reset_index(name='Total_Addresses')
     
     def get_category(count):
@@ -76,7 +67,6 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
         avg_addresses = total_addresses / total_territories if total_territories > 0 else 0
         largest_terr = counts_df.loc[counts_df['Total_Addresses'].idxmax()] if total_territories > 0 else None
         smallest_terr = counts_df.loc[counts_df['Total_Addresses'].idxmin()] if total_territories > 0 else None
-        
         ideal_pct = (len(counts_df[counts_df['Category'] == 'Ideal']) / total_territories) * 100 if total_territories > 0 else 0
         
         dashboard_data = [
@@ -95,7 +85,6 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
         
         pd.DataFrame(dashboard_data).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
         
-        # Dashboard Distribution Grid
         ranges = ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"]
         distribution = []
         for r in ranges:
@@ -107,11 +96,8 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
         pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=13, index=False)
 
         # --- TAB 2: COUNT PER TERRITORY ---
-        # Sort naturally by territory name
         counts_df_sorted = counts_df.sort_values(by='Territory_Name')
         counts_df_sorted.to_excel(writer, sheet_name="Counts", index=False)
-        
-        # Apply Conditional Formatting to Tab 2
         worksheet = writer.sheets['Counts']
         for row in range(2, len(counts_df_sorted) + 2):
             cell = worksheet[f'C{row}']
@@ -123,7 +109,6 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
                 cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
         # --- TAB 3: ADDRESS LIST ---
-        # Build Mailable Address (Cleans up nulls and formats nicely)
         def build_address(row):
             addr = str(row['FullAddr']) if pd.notna(row['FullAddr']) else ""
             unit = f" Apt {str(row['Unit'])}" if pd.notna(row['Unit']) and str(row['Unit']).strip() != "" else ""
@@ -132,30 +117,22 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
             return f"{addr}{unit}, {muni}, WI {zip_c}".strip(" ,")
 
         joined_gdf['Mailable_Address'] = joined_gdf.apply(build_address, axis=1)
-        
-        # Sort by Zip -> Street -> HouseNo for logical walking/mailing order
         joined_gdf['HouseNum_Sort'] = pd.to_numeric(joined_gdf['HouseNo'], errors='coerce').fillna(0)
         address_list_df = joined_gdf.sort_values(by=['Territory_Name', 'Zip_Code', 'Street', 'HouseNum_Sort'])
         
-        # Prepare hidden columns for potential system imports
         export_df = address_list_df[['Territory_Name', 'Mailable_Address', 'HouseNo', 'Street', 'Unit', 'Zip_Code']]
         export_df.to_excel(writer, sheet_name="Address List", index=False)
         
-        # Hide columns C, D, E, F
         ws3 = writer.sheets['Address List']
         ws3.column_dimensions['C'].hidden = True
         ws3.column_dimensions['D'].hidden = True
         ws3.column_dimensions['E'].hidden = True
         ws3.column_dimensions['F'].hidden = True
-        ws3.column_dimensions['B'].width = 40 # Make Address column wide
+        ws3.column_dimensions['B'].width = 40
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
-        # Group by Base Address (FullAddr + Zip)
         apt_groups = joined_gdf.groupby(['Territory_Name', 'FullAddr', 'Zip_Code']).size().reset_index(name='Total_Units')
-        # Filter for 5+ units
         apt_groups = apt_groups[apt_groups['Total_Units'] >= 5]
-        
-        # Map Category back in
         cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
         apt_groups['Status'] = apt_groups['Territory_Name'].map(cat_mapping)
         
@@ -163,30 +140,22 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
             return f"{row['Territory_Name']} - [{row['Status']}] - {row['FullAddr']} - {row['Total_Units']} Units"
             
         apt_groups['Complex_Title'] = apt_groups.apply(format_complex, axis=1)
-        
         apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status']]
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
         writer.sheets['Apartments'].column_dimensions['A'].width = 60
 
-        # --- TAB 5: BORDER REWRITES (Spatial Adjacency Optimization) ---
-        # 1. Pre-filter into Oversized and Undersized
+        # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist()
         undersized = counts_df[counts_df['Category'] == 'Undersized']['Territory_Name'].tolist()
-        
-        # Re-load KML geometries for boundary checking
         terr_geoms = joined_gdf.drop_duplicates('Territory_Name')[['Territory_Name', 'geometry_terr']].set_index('Territory_Name')
-        
         suggestions = []
         
-        # 2. R-Tree Adjacency check using .touches()
         for over_name in oversized:
             over_geom = terr_geoms.loc[over_name, 'geometry_terr']
             over_count = counts_df[counts_df['Territory_Name'] == over_name]['Total_Addresses'].values[0]
             
             for under_name in undersized:
                 under_geom = terr_geoms.loc[under_name, 'geometry_terr']
-                
-                # Check if the polygons physically touch
                 if over_geom.touches(under_geom) or over_geom.intersects(under_geom):
                     under_count = counts_df[counts_df['Territory_Name'] == under_name]['Total_Addresses'].values[0]
                     rec = f"{over_name} ({over_count} addrs) borders {under_name} ({under_count} addrs). Shift border."
@@ -196,17 +165,16 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
         writer.sheets['Border Rewrites'].column_dimensions['E'].width = 80
 
         # Tab colorization
-        writer.sheets['Dashboard'].sheet_properties.tabColor = "1E90FF" # Blue
-        writer.sheets['Counts'].sheet_properties.tabColor = "32CD32" # Green
-        writer.sheets['Address List'].sheet_properties.tabColor = "32CD32" # Green
-        writer.sheets['Apartments'].sheet_properties.tabColor = "FF8C00" # Orange
-        writer.sheets['Border Rewrites'].sheet_properties.tabColor = "FF0000" # Red
+        writer.sheets['Dashboard'].sheet_properties.tabColor = "1E90FF"
+        writer.sheets['Counts'].sheet_properties.tabColor = "32CD32"
+        writer.sheets['Address List'].sheet_properties.tabColor = "32CD32"
+        writer.sheets['Apartments'].sheet_properties.tabColor = "FF8C00"
+        writer.sheets['Border Rewrites'].sheet_properties.tabColor = "FF0000"
 
     output.seek(0)
     return output
 
 # --- 4. EXECUTION FLOW ---
-# Clear session state if a new file is uploaded to prevent downloading old data
 if 'last_uploaded_kml' not in st.session_state:
     st.session_state['last_uploaded_kml'] = None
 
@@ -223,7 +191,6 @@ if uploaded_kml:
         if parcel_gdf is not None:
             with st.spinner("Parsing KML Territories & Executing Spatial Join..."):
                 try:
-                    # Load KML
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
                     # Dynamic KML Name parsing (Pandas 3.0 Safe)
@@ -236,40 +203,30 @@ if uploaded_kml:
                     else:
                         kml_gdf['Territory_Name'] = fallback_names
                     
-                    # Pre-Join Optimization: Clip County Data to KML Bounding Box Envelope to save massive memory
                     bounding_box = kml_gdf.unary_union.envelope
                     parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
                     
-                    # Ensure CRS Match
                     if parcel_gdf.crs != kml_gdf.crs:
                         parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
                     
-                    # Spatial Join
-                    # We rename kml_gdf geometry temporarily to save it for Tab 5 (Border Rewrites)
                     kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
                     kml_gdf = kml_gdf.set_geometry('geometry_terr')
                     
                     joined_gdf = gpd.sjoin(parcel_gdf, kml_gdf, how="inner", predicate="within")
-                    
-                    # Drop rows where territory didn't match
                     joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
                     
                     with st.spinner("Generating Excel Report..."):
                         excel_file = generate_excel_report(joined_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
-                        
                         filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
                         
-                        # Store in session_state to survive the re-run!
                         st.session_state['excel_data'] = excel_file.getvalue()
                         st.session_state['excel_filename'] = filename
                         
                         st.success("Analysis Complete!")
                         
                 except Exception as e:
-                    # THIS is the line that went missing!
                     st.error(f"An error occurred during processing: {e}")
 
-    # Display the download button completely independently of the Generate button state
     if 'excel_data' in st.session_state:
         st.info("Analysis results ready for download.")
         st.download_button(
