@@ -48,7 +48,8 @@ def load_county_data(county_name):
     return None
 
 # --- 3. EXCEL GENERATION ENGINE ---
-def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
+# Notice we added kml_gdf here so Tab 5 can see the borders!
+def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
     counts_df = joined_gdf.groupby('Territory_Name').size().reset_index(name='Total_Addresses')
     
@@ -147,7 +148,9 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist()
         undersized = counts_df[counts_df['Category'] == 'Undersized']['Territory_Name'].tolist()
-        terr_geoms = joined_gdf.drop_duplicates('Territory_Name')[['Territory_Name', 'geometry_terr']].set_index('Territory_Name')
+        
+        # FIX: Look at the raw kml_gdf for borders, not the joined_gdf!
+        terr_geoms = kml_gdf.drop_duplicates('Territory_Name').set_index('Territory_Name')
         suggestions = []
         
         for over_name in oversized:
@@ -193,7 +196,7 @@ if uploaded_kml:
                 try:
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
-                    # --- THE FIX: AUTO-REPAIR INVALID POLYGONS ---
+                    # Auto-repair invalid polygons
                     kml_gdf['geometry'] = kml_gdf['geometry'].make_valid()
                     
                     # Dynamic KML Name parsing (Pandas 3.0 Safe)
@@ -219,7 +222,8 @@ if uploaded_kml:
                     joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
                     
                     with st.spinner("Generating Excel Report..."):
-                        excel_file = generate_excel_report(joined_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
+                        # Passed kml_gdf into the function here!
+                        excel_file = generate_excel_report(joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
                         filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
                         
                         st.session_state['excel_data'] = excel_file.getvalue()
