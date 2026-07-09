@@ -48,7 +48,6 @@ def load_county_data(county_name):
     return None
 
 # --- 3. EXCEL GENERATION ENGINE ---
-# Notice we added kml_gdf here so Tab 5 can see the borders!
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
     counts_df = joined_gdf.groupby('Territory_Name').size().reset_index(name='Total_Addresses')
@@ -134,36 +133,46 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
         apt_groups = joined_gdf.groupby(['Territory_Name', 'FullAddr', 'Zip_Code']).size().reset_index(name='Total_Units')
         apt_groups = apt_groups[apt_groups['Total_Units'] >= 5]
-        cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
-        apt_groups['Status'] = apt_groups['Territory_Name'].map(cat_mapping)
+        
+        # Only map statuses if counts_df is not empty
+        if not counts_df.empty:
+            cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
+            apt_groups['Status'] = apt_groups['Territory_Name'].map(cat_mapping)
+        else:
+            apt_groups['Status'] = "Unknown"
         
         def format_complex(row):
             return f"{row['Territory_Name']} - [{row['Status']}] - {row['FullAddr']} - {row['Total_Units']} Units"
             
-        apt_groups['Complex_Title'] = apt_groups.apply(format_complex, axis=1)
-        apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status']]
+        if not apt_groups.empty:
+            apt_groups['Complex_Title'] = apt_groups.apply(format_complex, axis=1)
+            apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status']]
+        else:
+            apt_export = pd.DataFrame(columns=['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status'])
+            
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
         writer.sheets['Apartments'].column_dimensions['A'].width = 60
 
         # --- TAB 5: BORDER REWRITES ---
-        oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist()
-        undersized = counts_df[counts_df['Category'] == 'Undersized']['Territory_Name'].tolist()
+        oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist() if not counts_df.empty else []
+        undersized = counts_df[counts_df['Category'] == 'Undersized']['Territory_Name'].tolist() if not counts_df.empty else []
         
-        # FIX: Look at the raw kml_gdf for borders, not the joined_gdf!
         terr_geoms = kml_gdf.drop_duplicates('Territory_Name').set_index('Territory_Name')
         suggestions = []
         
         for over_name in oversized:
-            over_geom = terr_geoms.loc[over_name, 'geometry_terr']
-            over_count = counts_df[counts_df['Territory_Name'] == over_name]['Total_Addresses'].values[0]
-            
-            for under_name in undersized:
-                under_geom = terr_geoms.loc[under_name, 'geometry_terr']
-                if over_geom.touches(under_geom) or over_geom.intersects(under_geom):
-                    under_count = counts_df[counts_df['Territory_Name'] == under_name]['Total_Addresses'].values[0]
-                    rec = f"{over_name} ({over_count} addrs) borders {under_name} ({under_count} addrs). Shift border."
-                    suggestions.append([over_name, over_count, under_name, under_count, rec])
-                    
+            if over_name in terr_geoms.index:
+                over_geom = terr_geoms.loc[over_name, 'geometry_terr']
+                over_count = counts_df[counts_df['Territory_Name'] == over_name]['Total_Addresses'].values[0]
+                
+                for under_name in undersized:
+                    if under_name in terr_geoms.index:
+                        under_geom = terr_geoms.loc[under_name, 'geometry_terr']
+                        if over_geom.touches(under_geom) or over_geom.intersects(under_geom):
+                            under_count = counts_df[counts_df['Territory_Name'] == under_name]['Total_Addresses'].values[0]
+                            rec = f"{over_name} ({over_count} addrs) borders {under_name} ({under_count} addrs). Shift border."
+                            suggestions.append([over_name, over_count, under_name, under_count, rec])
+                        
         pd.DataFrame(suggestions, columns=["Oversized Territory", "Current Count", "Adjacent Undersized", "Current Count", "Recommendation"]).to_excel(writer, sheet_name="Border Rewrites", index=False)
         writer.sheets['Border Rewrites'].column_dimensions['E'].width = 80
 
@@ -209,11 +218,15 @@ if uploaded_kml:
                     else:
                         kml_gdf['Territory_Name'] = fallback_names
                     
-                    bounding_box = kml_gdf.unary_union.envelope
-                    parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
-                    
+                    # --- THE FIX: SWAPPED ORDER OF OPERATIONS ---
+                    # 1. Translate Coordinates FIRST
                     if parcel_gdf.crs != kml_gdf.crs:
                         parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
+                        
+                    # 2. THEN Clip the Bounding Box
+                    bounding_box = kml_gdf.unary_union.envelope
+                    parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
+                    # ------------------------------------------
                     
                     kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
                     kml_gdf = kml_gdf.set_geometry('geometry_terr')
@@ -222,7 +235,6 @@ if uploaded_kml:
                     joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
                     
                     with st.spinner("Generating Excel Report..."):
-                        # Passed kml_gdf into the function here!
                         excel_file = generate_excel_report(joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
                         filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
                         
