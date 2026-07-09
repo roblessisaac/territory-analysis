@@ -227,14 +227,16 @@ if uploaded_kml:
                     # Load KML
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
-                    # Dynamic KML Name parsing
-                    if 'Name' in kml_gdf.columns:
-                        kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(kml_gdf.index.astype(str))
-                    elif 'Description' in kml_gdf.columns:
-                        kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(kml_gdf.index.astype(str))
-                    else:
-                        kml_gdf['Territory_Name'] = "Territory_" + kml_gdf.index.astype(str)
-                    
+                    # Dynamic KML Name parsing (Pandas 3.0 Safe)
+fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
+
+if 'Name' in kml_gdf.columns:
+    kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(fallback_names)
+elif 'Description' in kml_gdf.columns:
+    kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(fallback_names)
+else:
+    kml_gdf['Territory_Name'] = fallback_names
+    
                     # Pre-Join Optimization: Clip County Data to KML Bounding Box Envelope to save massive memory
                     bounding_box = kml_gdf.unary_union.envelope
                     parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
