@@ -193,6 +193,9 @@ if uploaded_kml:
                 try:
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
+                    # --- THE FIX: AUTO-REPAIR INVALID POLYGONS ---
+                    kml_gdf['geometry'] = kml_gdf['geometry'].make_valid()
+                    
                     # Dynamic KML Name parsing (Pandas 3.0 Safe)
                     fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
                     
