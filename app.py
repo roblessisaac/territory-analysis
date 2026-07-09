@@ -215,7 +215,6 @@ if uploaded_kml != st.session_state['last_uploaded_kml']:
         del st.session_state['excel_data']
     st.session_state['last_uploaded_kml'] = uploaded_kml
 
-
 if uploaded_kml:
     if st.button("Generate Territory Analysis"):
         with st.spinner(f"Loading Master {selected_county} County Data..."):
@@ -228,15 +227,15 @@ if uploaded_kml:
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
                     # Dynamic KML Name parsing (Pandas 3.0 Safe)
-fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
-
-if 'Name' in kml_gdf.columns:
-    kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(fallback_names)
-elif 'Description' in kml_gdf.columns:
-    kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(fallback_names)
-else:
-    kml_gdf['Territory_Name'] = fallback_names
-    
+                    fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
+                    
+                    if 'Name' in kml_gdf.columns:
+                        kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(fallback_names)
+                    elif 'Description' in kml_gdf.columns:
+                        kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(fallback_names)
+                    else:
+                        kml_gdf['Territory_Name'] = fallback_names
+                    
                     # Pre-Join Optimization: Clip County Data to KML Bounding Box Envelope to save massive memory
                     bounding_box = kml_gdf.unary_union.envelope
                     parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
@@ -267,6 +266,7 @@ else:
                         st.success("Analysis Complete!")
                         
                 except Exception as e:
+                    # THIS is the line that went missing!
                     st.error(f"An error occurred during processing: {e}")
 
     # Display the download button completely independently of the Generate button state
