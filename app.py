@@ -206,54 +206,73 @@ def generate_excel_report(joined_gdf, min_goal, max_goal, cong_name):
     return output
 
 # --- 4. EXECUTION FLOW ---
-if uploaded_kml and st.button("Generate Territory Analysis"):
-    with st.spinner(f"Loading Master {selected_county} County Data..."):
-        parcel_gdf = load_county_data(selected_county)
-        
-    if parcel_gdf is not None:
-        with st.spinner("Parsing KML Territories & Executing Spatial Join..."):
-            try:
-                # Load KML
-                kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
-                
-                # Dynamic KML Name parsing
-                if 'Name' in kml_gdf.columns:
-                    kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(kml_gdf.index.astype(str))
-                elif 'Description' in kml_gdf.columns:
-                    kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(kml_gdf.index.astype(str))
-                else:
-                    kml_gdf['Territory_Name'] = "Territory_" + kml_gdf.index.astype(str)
-                
-                # Pre-Join Optimization: Clip County Data to KML Bounding Box Envelope to save massive memory
-                bounding_box = kml_gdf.unary_union.envelope
-                parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
-                
-                # Ensure CRS Match
-                if parcel_gdf.crs != kml_gdf.crs:
-                    parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
-                
-                # Spatial Join
-                # We rename kml_gdf geometry temporarily to save it for Tab 5 (Border Rewrites)
-                kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
-                kml_gdf = kml_gdf.set_geometry('geometry_terr')
-                
-                joined_gdf = gpd.sjoin(parcel_gdf, kml_gdf, how="inner", predicate="within")
-                
-                # Drop rows where territory didn't match
-                joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
-                
-                with st.spinner("Generating Excel Report..."):
-                    excel_file = generate_excel_report(joined_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
+# Clear session state if a new file is uploaded to prevent downloading old data
+if 'last_uploaded_kml' not in st.session_state:
+    st.session_state['last_uploaded_kml'] = None
+
+if uploaded_kml != st.session_state['last_uploaded_kml']:
+    if 'excel_data' in st.session_state:
+        del st.session_state['excel_data']
+    st.session_state['last_uploaded_kml'] = uploaded_kml
+
+
+if uploaded_kml:
+    if st.button("Generate Territory Analysis"):
+        with st.spinner(f"Loading Master {selected_county} County Data..."):
+            parcel_gdf = load_county_data(selected_county)
+            
+        if parcel_gdf is not None:
+            with st.spinner("Parsing KML Territories & Executing Spatial Join..."):
+                try:
+                    # Load KML
+                    kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
                     
-                    st.success("Analysis Complete!")
+                    # Dynamic KML Name parsing
+                    if 'Name' in kml_gdf.columns:
+                        kml_gdf['Territory_Name'] = kml_gdf['Name'].fillna(kml_gdf.index.astype(str))
+                    elif 'Description' in kml_gdf.columns:
+                        kml_gdf['Territory_Name'] = kml_gdf['Description'].fillna(kml_gdf.index.astype(str))
+                    else:
+                        kml_gdf['Territory_Name'] = "Territory_" + kml_gdf.index.astype(str)
                     
-                    filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
+                    # Pre-Join Optimization: Clip County Data to KML Bounding Box Envelope to save massive memory
+                    bounding_box = kml_gdf.unary_union.envelope
+                    parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
                     
-                    st.download_button(
-                        label="⬇️ Download Excel Analysis",
-                        data=excel_file,
-                        file_name=filename,
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-            except Exception as e:
-                st.error(f"An error occurred during processing: {e}")
+                    # Ensure CRS Match
+                    if parcel_gdf.crs != kml_gdf.crs:
+                        parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
+                    
+                    # Spatial Join
+                    # We rename kml_gdf geometry temporarily to save it for Tab 5 (Border Rewrites)
+                    kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
+                    kml_gdf = kml_gdf.set_geometry('geometry_terr')
+                    
+                    joined_gdf = gpd.sjoin(parcel_gdf, kml_gdf, how="inner", predicate="within")
+                    
+                    # Drop rows where territory didn't match
+                    joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
+                    
+                    with st.spinner("Generating Excel Report..."):
+                        excel_file = generate_excel_report(joined_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
+                        
+                        filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
+                        
+                        # Store in session_state to survive the re-run!
+                        st.session_state['excel_data'] = excel_file.getvalue()
+                        st.session_state['excel_filename'] = filename
+                        
+                        st.success("Analysis Complete!")
+                        
+                except Exception as e:
+                    st.error(f"An error occurred during processing: {e}")
+
+    # Display the download button completely independently of the Generate button state
+    if 'excel_data' in st.session_state:
+        st.info("Analysis results ready for download.")
+        st.download_button(
+            label="⬇️ Download Excel Analysis",
+            data=st.session_state['excel_data'],
+            file_name=st.session_state['excel_filename'],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
