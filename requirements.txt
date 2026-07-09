@@ -5,5 +5,3 @@ openpyxl
 shapely
 osmnx
 fiona
-datetime
-io
