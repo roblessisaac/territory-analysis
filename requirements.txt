@@ -3,5 +3,4 @@ geopandas
 pandas
 openpyxl
 shapely
-osmnx
 fiona
