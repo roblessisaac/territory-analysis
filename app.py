@@ -6,6 +6,7 @@ from openpyxl.styles import PatternFill
 import fiona
 import io
 import datetime
+import re
 
 # Enable KML support in GeoPandas
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
@@ -35,22 +36,51 @@ def load_county_data(county_name):
     if county_name == "Milwaukee":
         file_path = "zip://data/Milwaukee_Datapoints07072026.zip"
         try:
+            # FIX 3: Load ALL data. Do not filter invalid statuses here. 
+            # We need them for the spatial join so they can be audited later.
             gdf = gpd.read_file(file_path)
-            invalid_statuses = [
-                'Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility',
-                'Undeveloped Outlot', 'Sliver or Remnant', 'Non Addressable Assoc with Adj Parcel'
-            ]
-            gdf = gdf[~gdf['Addr_Statu'].isin(invalid_statuses)]
             return gdf
         except Exception as e:
             st.error(f"Error loading county shapefile. Check that the zip is in the /data/ folder. Error: {e}")
             return None
     return None
 
+# --- NATURAL SORTING HELPER ---
+def natural_keys(text):
+    """
+    Splits text into letters and numbers so Python sorts '2' before '10'
+    """
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text))]
+
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
-    counts_df = joined_gdf.groupby('Territory_Name').size().reset_index(name='Total_Addresses')
+    
+    # FIX 2: Slice Zip Codes down to 5 digits globally
+    joined_gdf['Zip_Code'] = joined_gdf['Zip_Code'].astype(str).str[:5]
+    
+    # FIX 3: Split the data into Valid Addresses and Excluded Audit Addresses
+    invalid_statuses = [
+        'Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility',
+        'Undeveloped Outlot', 'Sliver or Remnant', 'Non Addressable Assoc with Adj Parcel'
+    ]
+    excluded_gdf = joined_gdf[joined_gdf['Addr_Statu'].isin(invalid_statuses)].copy()
+    valid_gdf = joined_gdf[~joined_gdf['Addr_Statu'].isin(invalid_statuses)].copy()
+
+    # FIX 5: Apply Natural Sorting globally to the Territory_Name column
+    # By converting it to an ordered Categorical type, all Pandas grouping and sorting will respect 1, 2, 3... 10
+    unique_territories = valid_gdf['Territory_Name'].unique().tolist()
+    unique_territories.sort(key=natural_keys)
+    valid_gdf['Territory_Name'] = pd.Categorical(valid_gdf['Territory_Name'], categories=unique_territories, ordered=True)
+    
+    if not excluded_gdf.empty:
+        excluded_unique = excluded_gdf['Territory_Name'].unique().tolist()
+        excluded_unique.sort(key=natural_keys)
+        excluded_gdf['Territory_Name'] = pd.Categorical(excluded_gdf['Territory_Name'], categories=excluded_unique, ordered=True)
+
+    # Base counts off the VALID data only
+    counts_df = valid_gdf.groupby('Territory_Name', observed=True).size().reset_index(name='Total_Addresses')
+    counts_df = counts_df[counts_df['Total_Addresses'] > 0] # Remove 0-count artifacts
     
     def get_category(count):
         if count < min_goal: return "Undersized"
@@ -74,7 +104,9 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             [f"Analysis generated: {datetime.datetime.now().strftime('%B %Y')}"],
             [""],
             [f"Total Territories: {total_territories}"],
-            [f"Total Addresses: {total_addresses}"],
+            [f"Total Valid Addresses: {total_addresses}"],
+            [f"Excluded Addresses (See Tab 6): {len(excluded_gdf)}"],
+            [""],
             [f"Average Addresses per Territory: {int(avg_addresses)}"],
             [f"Largest Territory: {largest_terr['Territory_Name']} ({largest_terr['Total_Addresses']} addresses)" if largest_terr is not None else ""],
             [f"Smallest Territory: {smallest_terr['Territory_Name']} ({smallest_terr['Total_Addresses']} addresses)" if smallest_terr is not None else ""],
@@ -93,7 +125,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             cat = "Ideal" if rmin == min_goal else ("Undersized" if rmax <= min_goal else "Oversized")
             distribution.append([cat, r, count])
             
-        pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=13, index=False)
+        pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=15, index=False)
 
         # --- TAB 2: COUNT PER TERRITORY ---
         counts_df_sorted = counts_df.sort_values(by='Territory_Name')
@@ -108,18 +140,43 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             elif cell.value == 'Oversized':
                 cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
-        # --- TAB 3: ADDRESS LIST ---
+        # --- FIX 1: CUSTOM ADDRESS BUILDER ---
         def build_address(row):
-            addr = str(row['FullAddr']) if pd.notna(row['FullAddr']) else ""
-            unit = f" Apt {str(row['Unit'])}" if pd.notna(row['Unit']) and str(row['Unit']).strip() != "" else ""
-            muni = str(row['Muni']) if pd.notna(row['Muni']) else ""
-            zip_c = str(row['Zip_Code']) if pd.notna(row['Zip_Code']) else ""
-            return f"{addr}{unit}, {muni}, WI {zip_c}".strip(" ,")
+            # Cleanly extract parts and handle missing data/NaNs
+            house = str(row['HouseNo']).strip() if pd.notna(row['HouseNo']) else ""
+            house_sx = str(row['HouseSx']).strip() if pd.notna(row['HouseSx']) else ""
+            direction = str(row['Dir']).strip() if pd.notna(row['Dir']) else ""
+            street = str(row['Street']).strip() if pd.notna(row['Street']) else ""
+            st_type = str(row['StType']).strip() if pd.notna(row['StType']) else ""
+            muni = str(row['Muni']).strip() if pd.notna(row['Muni']) else ""
+            zip_c = str(row['Zip_Code']).strip() if pd.notna(row['Zip_Code']) else ""
+            
+            # Unit logic: only add "Apt " if unit actually exists
+            unit_val = str(row['Unit']).strip() if pd.notna(row['Unit']) else ""
+            unit_str = f" Apt {unit_val}" if unit_val and unit_val.lower() != "nan" else ""
 
-        joined_gdf['Mailable_Address'] = joined_gdf.apply(build_address, axis=1)
-        joined_gdf['HouseNum_Sort'] = pd.to_numeric(joined_gdf['HouseNo'], errors='coerce').fillna(0)
-        address_list_df = joined_gdf.sort_values(by=['Territory_Name', 'Zip_Code', 'Street', 'HouseNum_Sort'])
+            # Connect HouseNo and HouseSx without a space (e.g. 1452B)
+            full_house_num = f"{house}{house_sx}"
+            
+            # Combine street direction, name, and type with spaces
+            street_parts = [direction, street, st_type]
+            full_street = " ".join([p for p in street_parts if p and p.lower() != "nan"])
+
+            # Final Assembly
+            addr_line_1 = f"{full_house_num} {full_street}{unit_str},"
+            addr_line_2 = f" WI {zip_c}"
+            
+            # Returns: 1452B N 29TH ST Apt A, Milwaukee, WI 53208
+            return f"{addr_line_1} {muni},{addr_line_2}".replace(" ,", ",").strip()
+
+        # Apply Address Builder to Valid Data
+        valid_gdf['Mailable_Address'] = valid_gdf.apply(build_address, axis=1)
+        valid_gdf['HouseNum_Sort'] = pd.to_numeric(valid_gdf['HouseNo'], errors='coerce').fillna(0)
         
+        # FIX 4: Logical Address Sorting
+        address_list_df = valid_gdf.sort_values(by=['Territory_Name', 'Street', 'HouseNum_Sort', 'Unit'])
+        
+        # --- TAB 3: ADDRESS LIST ---
         export_df = address_list_df[['Territory_Name', 'Mailable_Address', 'HouseNo', 'Street', 'Unit', 'Zip_Code']]
         export_df.to_excel(writer, sheet_name="Address List", index=False)
         
@@ -128,13 +185,13 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws3.column_dimensions['D'].hidden = True
         ws3.column_dimensions['E'].hidden = True
         ws3.column_dimensions['F'].hidden = True
-        ws3.column_dimensions['B'].width = 40
+        ws3.column_dimensions['B'].width = 45
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
-        apt_groups = joined_gdf.groupby(['Territory_Name', 'FullAddr', 'Zip_Code']).size().reset_index(name='Total_Units')
+        # Still group by FullAddr to find identical points, but display the new Mailable_Address
+        apt_groups = valid_gdf.groupby(['Territory_Name', 'FullAddr', 'Mailable_Address']).size().reset_index(name='Total_Units')
         apt_groups = apt_groups[apt_groups['Total_Units'] >= 5]
         
-        # Only map statuses if counts_df is not empty
         if not counts_df.empty:
             cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
             apt_groups['Status'] = apt_groups['Territory_Name'].map(cat_mapping)
@@ -142,13 +199,14 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             apt_groups['Status'] = "Unknown"
         
         def format_complex(row):
-            return f"{row['Territory_Name']} - [{row['Status']}] - {row['FullAddr']} - {row['Total_Units']} Units"
+            base_address = str(row['Mailable_Address']).split("Apt")[0].strip(" ,") # Strip Apt off the title
+            return f"{row['Territory_Name']} - [{row['Status']}] - {base_address} - {row['Total_Units']} Units"
             
         if not apt_groups.empty:
             apt_groups['Complex_Title'] = apt_groups.apply(format_complex, axis=1)
-            apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status']]
+            apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'Mailable_Address', 'Total_Units', 'Status']]
         else:
-            apt_export = pd.DataFrame(columns=['Complex_Title', 'Territory_Name', 'FullAddr', 'Total_Units', 'Status'])
+            apt_export = pd.DataFrame(columns=['Complex_Title', 'Territory_Name', 'Mailable_Address', 'Total_Units', 'Status'])
             
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
         writer.sheets['Apartments'].column_dimensions['A'].width = 60
@@ -176,12 +234,36 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         pd.DataFrame(suggestions, columns=["Oversized Territory", "Current Count", "Adjacent Undersized", "Current Count", "Recommendation"]).to_excel(writer, sheet_name="Border Rewrites", index=False)
         writer.sheets['Border Rewrites'].column_dimensions['E'].width = 80
 
+        # --- TAB 6: EXCLUDED AUDIT ---
+        # FIX 3: Output all addresses ignored by the engine due to status
+        if not excluded_gdf.empty:
+            excluded_gdf['Mailable_Address'] = excluded_gdf.apply(build_address, axis=1)
+            excluded_gdf['HouseNum_Sort'] = pd.to_numeric(excluded_gdf['HouseNo'], errors='coerce').fillna(0)
+            
+            # Sort by Territory, Street, and Number just like Tab 3
+            excluded_list_df = excluded_gdf.sort_values(by=['Territory_Name', 'Street', 'HouseNum_Sort', 'Unit'])
+            
+            export_ex_df = excluded_list_df[['Territory_Name', 'Mailable_Address', 'Addr_Statu', 'HouseNo', 'Street', 'Unit', 'Zip_Code']]
+            export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
+            
+            ws6 = writer.sheets['Excluded Audit']
+            ws6.column_dimensions['D'].hidden = True
+            ws6.column_dimensions['E'].hidden = True
+            ws6.column_dimensions['F'].hidden = True
+            ws6.column_dimensions['G'].hidden = True
+            ws6.column_dimensions['B'].width = 45
+            ws6.column_dimensions['C'].width = 30
+        else:
+            pd.DataFrame(columns=["Notice"]).to_excel(writer, sheet_name="Excluded Audit", index=False)
+            writer.sheets['Excluded Audit'].cell(row=2, column=1, value="No addresses were excluded in this map area.")
+
         # Tab colorization
         writer.sheets['Dashboard'].sheet_properties.tabColor = "1E90FF"
         writer.sheets['Counts'].sheet_properties.tabColor = "32CD32"
         writer.sheets['Address List'].sheet_properties.tabColor = "32CD32"
         writer.sheets['Apartments'].sheet_properties.tabColor = "FF8C00"
         writer.sheets['Border Rewrites'].sheet_properties.tabColor = "FF0000"
+        writer.sheets['Excluded Audit'].sheet_properties.tabColor = "808080" # Gray for Audit Tab
 
     output.seek(0)
     return output
@@ -218,7 +300,6 @@ if uploaded_kml:
                     else:
                         kml_gdf['Territory_Name'] = fallback_names
                     
-                    # --- THE FIX: SWAPPED ORDER OF OPERATIONS ---
                     # 1. Translate Coordinates FIRST
                     if parcel_gdf.crs != kml_gdf.crs:
                         parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
@@ -226,11 +307,11 @@ if uploaded_kml:
                     # 2. THEN Clip the Bounding Box
                     bounding_box = kml_gdf.unary_union.envelope
                     parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
-                    # ------------------------------------------
                     
                     kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
                     kml_gdf = kml_gdf.set_geometry('geometry_terr')
                     
+                    # FIX 3 (Order of Ops): Spatial Join ALL points into territories first
                     joined_gdf = gpd.sjoin(parcel_gdf, kml_gdf, how="inner", predicate="within")
                     joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
                     
