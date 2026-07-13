@@ -2,7 +2,7 @@ import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Alignment
+from openpyxl.styles import PatternFill, Alignment, Font
 import fiona
 import io
 import datetime
@@ -89,7 +89,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     # Slice Zip Codes down to 5 digits
     joined_gdf['Zip_Code'] = joined_gdf['Zip_Code'].astype(str).str[:5]
     
-    # Apply Address Builder to the entire dataset so both Valid and Excluded get formatted
+    # Apply Address Builder to the entire dataset
     joined_gdf[['Base_Address', 'Mailable_Address']] = joined_gdf.apply(build_addresses, axis=1)
     
     # Order of Operations: Split the data AFTER the spatial join
@@ -112,7 +112,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
     # Base counts off the VALID data only
     counts_df = valid_gdf.groupby('Territory_Name', observed=True).size().reset_index(name='Total_Addresses')
-    counts_df = counts_df[counts_df['Total_Addresses'] > 0] # Remove 0-count artifacts
+    counts_df = counts_df[counts_df['Total_Addresses'] > 0]
     
     def get_category(count):
         if count < min_goal: return "Undersized"
@@ -126,7 +126,6 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         # --- TAB 1: DASHBOARD ---
         total_territories = len(counts_df)
         total_addresses = counts_df['Total_Addresses'].sum()
-        avg_addresses = total_addresses / total_territories if total_territories > 0 else 0
         largest_terr = counts_df.loc[counts_df['Total_Addresses'].idxmax()] if total_territories > 0 else None
         smallest_terr = counts_df.loc[counts_df['Total_Addresses'].idxmin()] if total_territories > 0 else None
         ideal_pct = (len(counts_df[counts_df['Category'] == 'Ideal']) / total_territories) * 100 if total_territories > 0 else 0
@@ -136,22 +135,23 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         smallest_name = smallest_terr['Territory_Name'] if smallest_terr is not None else ""
         smallest_count = smallest_terr['Total_Addresses'] if smallest_terr is not None else 0
 
-        # Build Dashboard Rows 1-10
+        # Build Dashboard Rows 1-11
         dashboard_top = [
-            [f"{cong_name}"],
-            [f"This is the analysis for {cong_name} generated {datetime.datetime.now().strftime('%B %Y')} by Territory Audit Engine."],
-            ["Note: It is suggested that you export this into a program you can easily edit to expand cells to read easier, create filters to see specific data, and customize to make more legible."],
+            [f"Territory Analysis: {cong_name}"],
+            [f"Generated {datetime.datetime.now().strftime('%B %Y')} by Territory Analysis Engine."],
             [""],
-            [f"In summary, {cong_name} has {total_territories} total territories and {total_addresses} total addresses. That makes for an average of {int(avg_addresses)} addresses per territory."],
+            [f"Total Territories: {total_territories}"],
+            [f"Total Valid Addresses: {total_addresses}"],
+            [f"Excluded Addresses (See Tab 6): {len(excluded_gdf)}"],
             [f"The largest territory has {largest_count} addresses in it ({largest_name})."],
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
-            [f"The goal range, as defined by the user, is {min_goal}-{max_goal}."],
+            [f"Goal Range: {min_goal}-{max_goal}"],
             [f"About {ideal_pct:.1f}% of territories fall within this range."]
         ]
         pd.DataFrame(dashboard_top).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
         
-        # Build Dashboard Rows 11-17 (Data Grid)
+        # Build Dashboard Data Grid (Rows 12-18)
         ranges = ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"]
         distribution = []
         for r in ranges:
@@ -160,23 +160,31 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             cat = "Ideal" if rmin == min_goal else ("Undersized" if rmax <= min_goal else "Oversized")
             distribution.append([cat, r, count])
             
-        pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=10, index=False)
+        pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=11, index=False)
 
-        # Build Dashboard Rows 18-21
+        # Build Dashboard Bottom Narratives (Rows 19-22)
         dashboard_bottom = [
             [""],
-            ["Be sure to make full use of this data! Ensure that you look at the other tabs included on this spreadsheet to see more specific trends."],
-            ["As a part of this analysis, every address point within your territory was collected & identified. If you’d like to incorporate these specific addresses into your territory management system, please see [Website URL] to see if your system is supported."],
-            ["As a note, don’t forget to use the powerful filtering features on excel/sheets to gain insight on specific territories."]
+            ["As a part of this analysis, every address point within your territory was collected & identified. If you’d like to incorporate these specific addresses into your territory management system, please see http://www.territoryanalysis.com/ to see if your system is supported."],
+            ["Note: It is suggested that you export this into a program you can easily edit to expand cells to read easier, create filters to see specific data, and customize to make them more legible."],
+            ["If you have questions on what any data in the spreadsheet means, please see http://www.territoryanalysis.com/ for explanation"]
         ]
-        pd.DataFrame(dashboard_bottom).to_excel(writer, sheet_name="Dashboard", startrow=17, index=False, header=False)
+        pd.DataFrame(dashboard_bottom).to_excel(writer, sheet_name="Dashboard", startrow=18, index=False, header=False)
 
-        # Apply OpenPyXL formatting to make Dashboard paragraphs readable
+        # Apply OpenPyXL formatting to Dashboard
         ws1 = writer.sheets['Dashboard']
         ws1.column_dimensions['A'].width = 110
-        for row in ws1.iter_rows(min_row=1, max_row=22, min_col=1, max_col=1):
-            for cell in row:
-                cell.alignment = Alignment(wrap_text=True)
+        
+        # Formatting Row 1 (Title)
+        ws1['A1'].font = Font(size=20, bold=True)
+        
+        # Formatting Row 2 (Hyperlink)
+        ws1['A2'].hyperlink = "http://www.territoryanalysis.com/"
+        ws1['A2'].font = Font(color="0563C1", underline="single")
+        
+        # Text Wrapping ONLY the bottom rows (Rows 20, 21, 22 in Excel)
+        for r in [20, 21, 22]:
+            ws1.cell(row=r, column=1).alignment = Alignment(wrap_text=True)
 
         # --- TAB 2: COUNT PER TERRITORY ---
         counts_df_sorted = counts_df.sort_values(by='Territory_Name')
@@ -192,7 +200,6 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
                 cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
 
         # --- TAB 3: ADDRESS LIST ---
-        # Logical Sorting: Territory -> Street -> House (Integer) -> Unit
         valid_gdf['HouseNum_Sort'] = pd.to_numeric(valid_gdf['HouseNo'], errors='coerce').fillna(0)
         address_list_df = valid_gdf.sort_values(by=['Territory_Name', 'Street', 'HouseNum_Sort', 'Unit'])
         
@@ -207,9 +214,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws3.column_dimensions['B'].width = 45
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
-        # Streamlined Grouping using exclusively the Unit-less Base Address
-        apt_groups = valid_gdf.groupby(['Territory_Name', 'Base_Address'], observed=True).size().reset_index(name='Total_Units')
-        apt_groups = apt_groups[apt_groups['Total_Units'] >= 5]
+        apt_groups = valid_gdf.groupby(['Territory_Name', 'Base_Address'], observed=True).size().reset_index(name='Total Units')
+        apt_groups = apt_groups[apt_groups['Total Units'] >= 5]
         
         if not counts_df.empty:
             cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
@@ -217,18 +223,19 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         else:
             apt_groups['Status'] = "Unknown"
         
-        def format_complex(row):
-            return f"{row['Territory_Name']} - [{row['Status']}] - {row['Base_Address']} - {row['Total_Units']} Units"
+        def format_terr_name(row):
+            return f"{row['Territory_Name']} [{row['Status']}]"
             
         if not apt_groups.empty:
-            apt_groups['Complex_Title'] = apt_groups.apply(format_complex, axis=1)
-            apt_export = apt_groups[['Complex_Title', 'Territory_Name', 'Base_Address', 'Total_Units', 'Status']]
+            apt_groups['Territory Name'] = apt_groups.apply(format_terr_name, axis=1)
+            apt_groups.rename(columns={'Base_Address': 'Base Address'}, inplace=True)
+            apt_export = apt_groups[['Territory Name', 'Base Address', 'Total Units']]
         else:
-            apt_export = pd.DataFrame(columns=['Complex_Title', 'Territory_Name', 'Base_Address', 'Total_Units', 'Status'])
+            apt_export = pd.DataFrame(columns=['Territory Name', 'Base Address', 'Total Units'])
             
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
-        writer.sheets['Apartments'].column_dimensions['A'].width = 80
-        writer.sheets['Apartments'].column_dimensions['C'].width = 40
+        writer.sheets['Apartments'].column_dimensions['A'].width = 30
+        writer.sheets['Apartments'].column_dimensions['B'].width = 40
 
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist() if not counts_df.empty else []
@@ -247,8 +254,6 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
                         under_geom = terr_geoms.loc[under_name, 'geometry_terr']
                         if over_geom.touches(under_geom) or over_geom.intersects(under_geom):
                             under_count = counts_df[counts_df['Territory_Name'] == under_name]['Total_Addresses'].values[0]
-                            
-                            # Actionable Math formatting
                             diff = abs(over_count - under_count)
                             rec = f"That is a {diff} address difference. Shrink {over_name} & Expand {under_name}."
                             suggestions.append([over_name, over_count, under_name, under_count, rec])
@@ -275,13 +280,21 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             pd.DataFrame(columns=["Notice"]).to_excel(writer, sheet_name="Excluded Audit", index=False)
             writer.sheets['Excluded Audit'].cell(row=2, column=1, value="No addresses were excluded in this map area.")
 
+        # --- EXCEL UX POLISH (FREEZE PANES & BOLD HEADERS) ---
+        tabs_to_format = ["Counts", "Address List", "Apartments", "Border Rewrites", "Excluded Audit"]
+        for tab_name in tabs_to_format:
+            ws = writer.sheets[tab_name]
+            ws.freeze_panes = 'A2' # Freezes Row 1
+            for cell in ws[1]:     # Bolds every cell in Row 1
+                cell.font = Font(bold=True)
+
         # Tab colorization
         writer.sheets['Dashboard'].sheet_properties.tabColor = "1E90FF"
         writer.sheets['Counts'].sheet_properties.tabColor = "32CD32"
         writer.sheets['Address List'].sheet_properties.tabColor = "32CD32"
         writer.sheets['Apartments'].sheet_properties.tabColor = "FF8C00"
         writer.sheets['Border Rewrites'].sheet_properties.tabColor = "FF0000"
-        writer.sheets['Excluded Audit'].sheet_properties.tabColor = "808080" # Gray Audit Tab
+        writer.sheets['Excluded Audit'].sheet_properties.tabColor = "808080" 
 
     output.seek(0)
     return output
@@ -304,7 +317,6 @@ if uploaded_kml:
             with st.spinner("Parsing KML Territories & Executing Spatial Join..."):
                 try:
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
-                    
                     kml_gdf['geometry'] = kml_gdf['geometry'].make_valid()
                     
                     fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
@@ -315,18 +327,15 @@ if uploaded_kml:
                     else:
                         kml_gdf['Territory_Name'] = fallback_names
                     
-                    # 1. Translate Coordinates FIRST
                     if parcel_gdf.crs != kml_gdf.crs:
                         parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
                         
-                    # 2. THEN Clip the Bounding Box
                     bounding_box = kml_gdf.unary_union.envelope
                     parcel_gdf = gpd.clip(parcel_gdf, bounding_box)
                     
                     kml_gdf = kml_gdf.rename(columns={'geometry': 'geometry_terr'})
                     kml_gdf = kml_gdf.set_geometry('geometry_terr')
                     
-                    # 3. Spatial Join ALL points into territories
                     joined_gdf = gpd.sjoin(parcel_gdf, kml_gdf, how="inner", predicate="within")
                     joined_gdf = joined_gdf.dropna(subset=['Territory_Name'])
                     
@@ -345,7 +354,7 @@ if uploaded_kml:
     if 'excel_data' in st.session_state:
         st.info("Analysis results ready for download.")
         st.download_button(
-            label="⬇️ Download Excel Analysis",
+            label="⬇️ Download Excel Analysis File",
             data=st.session_state['excel_data'],
             file_name=st.session_state['excel_filename'],
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
