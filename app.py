@@ -17,8 +17,8 @@ fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 # --- 1. CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="Territory Audit Engine", layout="wide")
 
-st.title("Congregation Territory Address Analyzer")
-st.markdown("Upload your KML map to generate a complete, filtered letter-writing database.")
+st.title("Congregation Territory Analysis Engine")
+st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
 
 st.sidebar.header("Step 1: Configuration")
 congregation_name = st.sidebar.text_input("Congregation Name (No Spaces)", "ExampleCongregation")
@@ -133,7 +133,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
             [f"Goal Range: {min_goal}-{max_goal}"],
-            [""] # Placeholder for Rich Text percentage
+            [""] 
         ]
         pd.DataFrame(dashboard_top).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
         
@@ -184,19 +184,19 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws1['A29'].value = CellRichText(["The ", TextBlock(bold_inline, "BORDER REWRITES"), " tab displays borders within your territory that may benefit from being redrawn. The intent is to shrink oversized territories adjacent to undersized territories. These are just suggestions."])
         ws1['A30'].value = CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."])
 
-        for r in range(20, 31):
-            ws1.cell(row=r, column=1).alignment = Alignment(wrap_text=True)
-
         # --- TAB 2: COUNT PER TERRITORY ---
         counts_df_sorted = counts_df.sort_values(by='Territory_Name').rename(columns={
             'Territory_Name': 'Territory Name', 
-            'Total_Addresses': 'Total # of Addresses'
+            'Total_Addresses': '# of Addresses'
         })
         counts_df_sorted.to_excel(writer, sheet_name="Counts", index=False)
         ws2 = writer.sheets['Counts']
         ws2.column_dimensions['A'].width = 15
+        ws2.column_dimensions['B'].width = 15
         ws2.column_dimensions['C'].width = 15
+        
         for row in range(2, len(counts_df_sorted) + 2):
+            ws2[f'B{row}'].alignment = Alignment(horizontal='center')
             cell = ws2[f'C{row}']
             if cell.value == 'Ideal':
                 cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
@@ -245,8 +245,13 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             apt_export = pd.DataFrame(columns=['Territory Name', 'Base Address', 'Total Units'])
             
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
-        writer.sheets['Apartments'].column_dimensions['A'].width = 30
-        writer.sheets['Apartments'].column_dimensions['B'].width = 40
+        ws4 = writer.sheets['Apartments']
+        ws4.column_dimensions['A'].width = 30
+        ws4.column_dimensions['B'].width = 40
+        ws4.column_dimensions['C'].width = 15
+        
+        for row in range(2, len(apt_export) + 2):
+            ws4[f'B{row}'].alignment = Alignment(horizontal='center')
 
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist() if not counts_df.empty else []
@@ -265,7 +270,6 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
                         under_geom = terr_geoms.loc[under_name, 'geometry_terr']
                         if over_geom.touches(under_geom) or over_geom.intersects(under_geom):
                             under_count = counts_df[counts_df['Territory_Name'] == under_name]['Total_Addresses'].values[0]
-                            # Placeholder for Pandas formatting
                             suggestions.append([over_name, over_count, under_name, under_count, ""])
                         
         pd.DataFrame(suggestions, columns=["Too Large", "Count", "Too Small", "Count ", "Recommendation"]).to_excel(writer, sheet_name="Border Rewrites", index=False)
