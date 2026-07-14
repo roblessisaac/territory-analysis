@@ -251,7 +251,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws4.column_dimensions['C'].width = 15
         
         for row in range(2, len(apt_export) + 2):
-            ws4[f'B{row}'].alignment = Alignment(horizontal='center')
+            ws4[f'C{row}'].alignment = Alignment(horizontal='center')
 
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df[counts_df['Category'] == 'Oversized']['Territory_Name'].tolist() if not counts_df.empty else []
