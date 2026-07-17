@@ -241,8 +241,7 @@ if uploaded_kml:
     if st.button("Generate Territory Analysis"):
         try:
             # 1. Load Milwaukee Shapefile
-            # Point this to exactly where your local Milwaukee shapefile is stored
-            shapefile_path = "data/Milwaukee_Datapoints.zip" 
+            shapefile_path = "data/Milwaukee_Datapoints07072026.zip" 
             parcel_gdf = gpd.read_file(f"zip://{shapefile_path}")
             
             # 2. Process KML
