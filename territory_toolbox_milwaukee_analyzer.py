@@ -223,7 +223,7 @@ def display_status_value(value: str) -> str:
 def normalize_zip_value(value: str) -> str:
     """
     Preserve ZIP as text. Supports 53208, 53208-1234, and numeric artifacts like 53208.0.
-    For Milwaukee output, this returns the leading 5-digit ZIP when present.
+    For Milwaukee output, this returns the leading 5-digit ZIP when present. Just FYI.
     """
     text = remove_trailing_dot_zero(value)
     if not text:
