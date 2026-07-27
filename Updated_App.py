@@ -194,7 +194,17 @@ def evaluate_data_quality(row):
     return " | ".join(issues)
 
 # --- 3. EXCEL GENERATION ENGINE ---
-def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, county_config):
+def generate_excel_report(
+    joined_gdf,
+    kml_gdf,
+    min_goal,
+    max_goal,
+    cong_name,
+    county_config,
+    apt_threshold,
+    kml_filename,
+    county_filename,
+):
     output = io.BytesIO()
     run_timestamp = datetime.datetime.now()
     state = county_config["state"]
@@ -203,13 +213,22 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
     joined_gdf = joined_gdf.copy()
     joined_gdf["Canonical_Zip_Code"] = joined_gdf["Canonical_Zip_Code"].map(normalize_zip_code)
-    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(lambda row: build_addresses(row, state), axis=1)
+    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(
+        lambda row: build_addresses(row, state),
+        axis=1,
+    )
     joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(evaluate_data_quality, axis=1)
     flagged_record_count = joined_gdf["Data_Quality_Flag"].ne("").sum()
 
-    normalized_excluded_statuses = {clean_field(status).upper() for status in excluded_statuses}
-    joined_gdf["Canonical_Status_Normalized"] = joined_gdf["Canonical_Status"].map(clean_field).str.upper()
-    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(normalized_excluded_statuses)
+    normalized_excluded_statuses = {
+        clean_field(status).upper() for status in excluded_statuses
+    }
+    joined_gdf["Canonical_Status_Normalized"] = (
+        joined_gdf["Canonical_Status"].map(clean_field).str.upper()
+    )
+    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(
+        normalized_excluded_statuses
+    )
     excluded_gdf = joined_gdf[exclusion_mask].copy()
     valid_gdf = joined_gdf[~exclusion_mask].copy()
 
@@ -257,7 +276,11 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         dashboard_top = [
             [f"Territory Analysis: {cong_name}"],
-            [f"Generated {run_timestamp.strftime('%B %Y')} by Territory Analysis Engine."],
+            [
+                "Generated on "
+                f"{run_timestamp.strftime('%Y-%m-%d %H:%M')} "
+                "by TerritoryToolbox (using the analysis tool)"
+            ],
             [""],
             [f"Total Territories: {total_territories}"],
             [f"Total Valid Addresses: {total_addresses}"],
@@ -265,7 +288,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             [f"The largest territory has {largest_count} addresses in it ({largest_name})."],
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
-            [f"Goal Range: {min_goal}-{max_goal}"],
+            [f"Ideal Address Range: ({min_goal}-{max_goal})"],
             [""]
         ]
         pd.DataFrame(dashboard_top).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
@@ -307,11 +330,17 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         ws1.column_dimensions["B"].width = 25
         ws1.column_dimensions["C"].width = 12
 
-        ws1["A1"].font = Font(size=20, bold=True)
-        ws1["A2"].hyperlink = "http://www.territoryanalysis.com/"
-        ws1["A2"].font = Font(color="0563C1", underline="single")
+        ws1["A1"].font = Font(size=20, bold=True, color="228B22")
+        ws1["A2"].hyperlink = None
+        ws1["A2"].font = Font(size=10, italic=True, color="B7B7B7")
 
         bold_inline = InlineFont(b=True)
+        ws1["A10"].value = CellRichText(
+            [
+                TextBlock(bold_inline, "Ideal Address Range"),
+                f": ({min_goal}-{max_goal})",
+            ]
+        )
         ws1["A11"].value = CellRichText(["About ", TextBlock(bold_inline, f"{ideal_pct:.1f}%"), " of territories fall within this range."])
 
         header_fill = PatternFill(start_color="C7CDDB", end_color="C7CDDB", fill_type="solid")
@@ -325,44 +354,142 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 for col in range(1, 4): ws1.cell(row=row_number, column=col).font = Font(bold=True)
 
         instruction_start = distribution_end_row + 2
-        instructions = [
-            CellRichText(["As a part of this analysis, every ", TextBlock(bold_inline, "address point"), " within your territory was collected & identified."]),
-            "These addresses, with a little reformatting, can be added to NWS or other programs (Please see http://www.territoryanalysis.com/ to see if your system is supported.)",
-            "It's suggested to export this file into a program you can easily edit, like excel or google sheets.",
-            "That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
-            "",
-            CellRichText(["The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"]),
-            CellRichText(["The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."]),
-            CellRichText(["The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."]),
-            CellRichText(["The ", TextBlock(bold_inline, "APARTMENTS"), " tab displays every multifamily above 5 units in your territory. Large units can be explanations for inflated door-to-door territories."]),
-            CellRichText(["The ", TextBlock(bold_inline, "BORDER REWRITES"), " tab displays borders within your territory that may benefit from being redrawn. The intent is to shrink oversized territories adjacent to undersized territories. These are just suggestions."]),
-            CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."])
+        volunteer_instructions = [
+            (
+                "These addresses, with a little reformatting, can be added "
+                "to NWS or other supported programs on "
+                "https://territorytoolbox.com"
+            ),
+            (
+                "It's suggested to export this file into a program you can "
+                "easily edit, like excel or google sheets."
+            ),
+            (
+                "That will allow you to expand cells to read easier, create "
+                "custom filters to see specific data, and customize the "
+                "sheet to make it more legible."
+            ),
         ]
 
-        for offset, instruction in enumerate(instructions):
+        for offset, instruction in enumerate(volunteer_instructions):
             row_number = instruction_start + offset
             cell = ws1.cell(row=row_number, column=1, value=instruction)
-            if "http" in str(instruction):
-                cell.hyperlink = "http://www.territoryanalysis.com/"
+            if "https://territorytoolbox.com" in instruction:
+                cell.hyperlink = "https://territorytoolbox.com"
                 cell.font = Font(color="0563C1", underline="single")
 
-        technical_start = instruction_start + len(instructions) + 2
+        features_start = instruction_start + len(volunteer_instructions) + 2
+        ws1.cell(
+            row=features_start,
+            column=1,
+            value="Features Of This Spreadsheet",
+        ).font = Font(bold=True, size=12)
+        ws1.cell(row=features_start, column=1).fill = header_fill
+        ws1.cell(row=features_start, column=2).fill = header_fill
+
+        feature_instructions = [
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "DASHBOARD"),
+                    " tab displays basic statistics about the territory "
+                    "that was analyzed",
+                ]
+            ),
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "COUNTS"),
+                    " tab organizes territories by size. This is done by "
+                    "'counting' workable addresses, not geographical size.",
+                ]
+            ),
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "ADDRESS LIST"),
+                    " tab displays every workable address in your territory.",
+                ]
+            ),
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "APARTMENTS"),
+                    " tab displays every multifamily above 5 units in your "
+                    "territory. Large units can be explanations for inflated "
+                    "door-to-door territories.",
+                ]
+            ),
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "BORDER REWRITES"),
+                    " tab displays borders within your territory that may "
+                    "benefit from being redrawn. The intent is to shrink "
+                    "oversized territories adjacent to undersized "
+                    "territories. These are just suggestions.",
+                ]
+            ),
+            CellRichText(
+                [
+                    "The ",
+                    TextBlock(bold_inline, "EXCLUDED AUDIT"),
+                    " tab displays addresses that are NOT counted towards "
+                    "your territory. These are usually addresses of highways, "
+                    "vacant lots, parks, etc. This is included for confidence.",
+                ]
+            ),
+        ]
+
+        for offset, instruction in enumerate(feature_instructions, start=1):
+            ws1.cell(
+                row=features_start + offset,
+                column=1,
+                value=instruction,
+            )
+
+        technical_start = features_start + len(feature_instructions) + 2
         ws1.cell(row=technical_start, column=1, value="Technical: Run Information").font = Font(bold=True, size=12)
         ws1.cell(row=technical_start, column=1).fill = header_fill
         ws1.cell(row=technical_start, column=2).fill = header_fill
 
         tech_info = [
-            ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %I:%M:%S %p")),
-            ("Goal Range Setting", f"{min_goal}-{max_goal} addresses"),
-            ("Total Records Loaded", len(joined_gdf)),
+            (
+                "Run Timestamp",
+                run_timestamp.strftime("%Y-%m-%d %H:%M"),
+            ),
+            (
+                "Ideal Address Range Setting",
+                f"{min_goal}-{max_goal} addresses",
+            ),
+            (
+                "Apartment Grouping Threshold",
+                f"{apt_threshold} units",
+            ),
+            ("Address Records Loaded", len(joined_gdf)),
             ("Valid Addresses Assigned", len(valid_gdf)),
             ("Excluded Address Count", len(excluded_gdf)),
-            ("Records Flagged with Warnings", flagged_record_count)
+            ("Records Flagged with Warnings", flagged_record_count),
+            ("KML Filename", kml_filename),
+            ("County Source Filename", county_filename),
         ]
 
         for offset, (label, value) in enumerate(tech_info, start=1):
-            ws1.cell(row=technical_start + offset, column=1, value=label).font = Font(bold=True)
-            ws1.cell(row=technical_start + offset, column=2, value=value)
+            row_number = technical_start + offset
+            label_cell = ws1.cell(
+                row=row_number,
+                column=1,
+                value=label,
+            )
+            value_cell = ws1.cell(
+                row=row_number,
+                column=2,
+                value=value,
+            )
+            label_cell.font = Font(bold=True)
+            value_cell.font = Font(bold=False)
+            label_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            value_cell.alignment = Alignment(wrap_text=True, vertical="top")
 
         def add_excel_table(worksheet, dataframe, table_name):
             if dataframe.empty: return
@@ -401,8 +528,16 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Data_Quality_Flag",
             "Canonical_HouseNo", "Canonical_HouseSx", "Canonical_Street", "Canonical_Unit", "Canonical_Muni", "Canonical_Zip_Code", "Latitude", "Longitude"
         ]].rename(columns={
-            "Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", "Data_Quality_Flag": "Data Quality Flag",
-            "Canonical_HouseNo": "HouseNo", "Canonical_HouseSx": "HouseSx", "Canonical_Street": "Street", "Canonical_Unit": "Unit", "Canonical_Muni": "Muni", "Canonical_Zip_Code": "Zip_Code"
+            "Source_Record_ID": "Source Record ID",
+            "Territory_Name": "Territory Name",
+            "Mailable_Address": "Mailable Address",
+            "Data_Quality_Flag": "Data Quality Flag",
+            "Canonical_HouseNo": "HouseNo",
+            "Canonical_HouseSx": "HouseSx",
+            "Canonical_Street": "Street",
+            "Canonical_Unit": "Unit",
+            "Canonical_Muni": "Muni",
+            "Canonical_Zip_Code": "Zip_Code",
         })
 
         export_df.to_excel(writer, sheet_name="Address List", index=False)
@@ -423,7 +558,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         apartment_source = apartment_source[apartment_source["_Unit_Normalized"].ne("") & apartment_source["Base_Address"].map(clean_field).ne("")].copy()
 
         apt_groups = apartment_source.groupby(["Territory_Name", "Base_Address"], observed=True)["_Unit_Normalized"].nunique().reset_index(name="Total Units")
-        apt_groups = apt_groups[apt_groups["Total Units"] >= 5].copy()
+        apt_groups = apt_groups[apt_groups["Total Units"] >= apt_threshold].copy()
 
         if not counts_df.empty:
             category_mapping = counts_df.set_index("Territory_Name")["Category"].to_dict()
@@ -511,9 +646,15 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Canonical_Status", "Data_Quality_Flag",
                 "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"
             ]].rename(columns={
-                "Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", 
-                "Canonical_Status": "Exclusion Reason", "Data_Quality_Flag": "Data Quality Flag",
-                "Canonical_HouseNo": "HouseNo", "Canonical_Street": "Street", "Canonical_Unit": "Unit", "Canonical_Zip_Code": "Zip_Code"
+                "Source_Record_ID": "Source Record ID",
+                "Territory_Name": "Territory Name",
+                "Mailable_Address": "Mailable Address",
+                "Canonical_Status": "Exclusion Reason",
+                "Data_Quality_Flag": "Data Quality Flag",
+                "Canonical_HouseNo": "HouseNo",
+                "Canonical_Street": "Street",
+                "Canonical_Unit": "Unit",
+                "Canonical_Zip_Code": "Zip_Code",
             })
             export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
             ws6 = writer.sheets["Excluded Audit"]
@@ -528,7 +669,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             ws6.column_dimensions["F"].width = 25
             ws6.column_dimensions["G"].width = 35
         else:
-            empty_excluded_columns = ["Source Record ID", "Territory Name", "NWS_Category", "NWS_Number", "Mailable Address", "Exclusion Reason", "Data Quality Flag", "HouseNo", "Street", "Unit", "Zip_Code"]
+            empty_excluded_columns = ["Source Record ID", "Territory Name", "NWS_Category", "NWS_Number", "Mailable Address", "Exclusion Reason", "Data Quality Flag", "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"]
             pd.DataFrame(columns=empty_excluded_columns).to_excel(writer, sheet_name="Excluded Audit", index=False)
             writer.sheets["Excluded Audit"].cell(row=2, column=1, value="No addresses were excluded in this map area.")
 
@@ -573,7 +714,6 @@ if uploaded_kml:
                 st.error("County data failed preflight validation. Missing required canonical columns: " + ", ".join(missing_columns))
                 st.stop()
 
-            # Ensure we default to Canonical_Native_Source_ID, or fall back immediately if it's completely missing
             native_id_col = "Canonical_Native_Source_ID"
             county_id_prefix = re.sub(r"[^A-Za-z0-9]+", "_", selected_county.upper()).strip("_")
             fallback_ids = pd.Series([f"{county_id_prefix}-FALLBACK-{row_number:09d}" for row_number in range(1, len(parcel_gdf) + 1)], index=parcel_gdf.index, dtype="string")
@@ -634,7 +774,17 @@ if uploaded_kml:
                         st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
 
                     with st.spinner("Generating Excel Report..."):
-                        excel_file = generate_excel_report(joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""), county_config)
+                        excel_file = generate_excel_report(
+                            joined_gdf,
+                            kml_gdf,
+                            MIN_GOAL,
+                            MAX_GOAL,
+                            congregation_name.replace(" ", ""),
+                            county_config,
+                            apt_threshold=5,
+                            kml_filename=uploaded_kml.name,
+                            county_filename=county_config["file_path"],
+                        )
                         filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
                         st.session_state["excel_data"] = excel_file.getvalue()
                         st.session_state["excel_filename"] = filename
