@@ -5,6 +5,7 @@ import openpyxl
 from openpyxl.styles import PatternFill, Alignment, Font
 from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.cell.text import InlineFont
+from openpyxl.worksheet.table import Table, TableStyleInfo
 import fiona
 import io
 import datetime
@@ -52,54 +53,38 @@ def natural_keys(text):
 
 # --- ADDRESS BUILDER + NORMALIZATION HELPERS ---
 def clean_field(value):
-    """Convert null-like values to an empty string without altering valid text."""
-    if pd.isna(value):
-        return ""
+    if pd.isna(value): return ""
     text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}:
-        return ""
+    if text.lower() in {"nan", "none", "<na>"}: return ""
     return text
 
 def normalize_house_number(value):
-    """Preserve fractional and alphanumeric house numbers while removing spreadsheet artifacts."""
     text = clean_field(value)
-    if not text:
-        return ""
-    if re.fullmatch(r"[+-]?\d+\.0+", text):
-        return text.split(".", 1)[0]
+    if not text: return ""
+    if re.fullmatch(r"[+-]?\d+\.0+", text): return text.split(".", 1)[0]
     return re.sub(r"\s+", " ", text)
 
 def normalize_zip_code(value):
-    """Normalize ZIP and ZIP+4 values while preserving leading zeros."""
     text = clean_field(value)
-    if not text:
-        return ""
+    if not text: return ""
     text = re.sub(r"\.0+$", "", text)
     digits = re.sub(r"\D", "", text)
     
-    if not digits:
-        return ""
-    if len(digits) == 4:
-        digits = digits.zfill(5)
-    elif len(digits) == 8:
-        digits = digits.zfill(9)
+    if not digits: return ""
+    if len(digits) == 4: digits = digits.zfill(5)
+    elif len(digits) == 8: digits = digits.zfill(9)
 
-    if len(digits) == 5:
-        return digits
-    if len(digits) == 9:
-        return f"{digits[:5]}-{digits[5:]}"
+    if len(digits) == 5: return digits
+    if len(digits) == 9: return f"{digits[:5]}-{digits[5:]}"
     if len(digits) > 9:
         digits = digits[:9]
         return f"{digits[:5]}-{digits[5:]}"
     return digits
 
 def normalize_unit(value):
-    """Preserve descriptive unit labels. Add 'Apt' only for bare unit identifiers."""
     text = clean_field(value)
-    if not text:
-        return ""
-    if re.fullmatch(r"\d+\.0+", text):
-        text = text.split(".", 1)[0]
+    if not text: return ""
+    if re.fullmatch(r"\d+\.0+", text): text = text.split(".", 1)[0]
     text = re.sub(r"\s+", " ", text).strip()
 
     descriptive_pattern = re.compile(
@@ -117,33 +102,26 @@ def normalize_unit(value):
         flags=re.IGNORECASE,
     )
 
-    if descriptive_pattern.search(text):
-        return text
+    if descriptive_pattern.search(text): return text
     return f"Apt {text}"
 
 def house_number_sort_parts(value):
-    """Produce stable sorting components for integer, decimal, fractional, hyphenated, and alphanumeric house numbers."""
     text = normalize_house_number(value).upper()
-    if not text:
-        return pd.Series([float("inf"), 9, ""])
+    if not text: return pd.Series([float("inf"), 9, ""])
     compact = re.sub(r"\s+", " ", text).strip()
 
     mixed_fraction = re.match(r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$", compact)
     if mixed_fraction:
         whole, numerator, denominator, suffix = mixed_fraction.groups()
-        try:
-            numeric_value = int(whole) + float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError):
-            numeric_value = float(int(whole))
+        try: numeric_value = int(whole) + float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError): numeric_value = float(int(whole))
         return pd.Series([numeric_value, 1, suffix.strip()])
 
     simple_fraction = re.match(r"^(\d+)\s*/\s*(\d+)(.*)$", compact)
     if simple_fraction:
         numerator, denominator, suffix = simple_fraction.groups()
-        try:
-            numeric_value = float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError):
-            numeric_value = float("inf")
+        try: numeric_value = float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError): numeric_value = float("inf")
         return pd.Series([numeric_value, 1, suffix.strip()])
 
     numeric_prefix = re.match(r"^(\d+(?:\.\d+)?)(.*)$", compact)
@@ -172,8 +150,7 @@ def build_addresses(row):
 
     locality_parts = [muni, "WI"]
     locality = ", ".join(part for part in locality_parts if part)
-    if zip_c:
-        locality = f"{locality} {zip_c}".strip()
+    if zip_c: locality = f"{locality} {zip_c}".strip()
 
     base_addr = ", ".join(part for part in [base_addr_line, locality] if part)
     mailable_addr_line = " ".join(part for part in [base_addr_line, unit_str] if part)
@@ -184,7 +161,8 @@ def build_addresses(row):
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
-    
+    run_timestamp = datetime.datetime.now()
+
     joined_gdf["Zip_Code"] = joined_gdf["Zip_Code"].map(normalize_zip_code)
     joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(build_addresses, axis=1)
     
@@ -205,7 +183,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         excluded_gdf['Territory_Name'] = pd.Categorical(excluded_gdf['Territory_Name'], categories=excluded_unique, ordered=True)
 
     counts_df = valid_gdf.groupby('Territory_Name', observed=True).size().reset_index(name='Total_Addresses')
-    counts_df = counts_df[counts_df['Total_Addresses'] > 0]
+    counts_df = counts_df[counts_df['Total_Addresses'] > 0].copy()
     
     def get_category(count):
         if count < min_goal: return "Undersized"
@@ -213,7 +191,17 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         else: return "Oversized"
         
     counts_df['Category'] = counts_df['Total_Addresses'].apply(get_category)
+
+    # NWS Explicit Extraction
+    valid_gdf[['NWS_Category', 'NWS_Number']] = valid_gdf['Territory_Name'].str.extract(r'^([A-Za-z]+)[-\s]+(.*)$')
+    valid_gdf['NWS_Category'] = valid_gdf['NWS_Category'].fillna("UNK")
+    valid_gdf['NWS_Number'] = valid_gdf['NWS_Number'].fillna("0")
     
+    if not excluded_gdf.empty:
+        excluded_gdf[['NWS_Category', 'NWS_Number']] = excluded_gdf['Territory_Name'].str.extract(r'^([A-Za-z]+)[-\s]+(.*)$')
+        excluded_gdf['NWS_Category'] = excluded_gdf['NWS_Category'].fillna("UNK")
+        excluded_gdf['NWS_Number'] = excluded_gdf['NWS_Number'].fillna("0")
+
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         
         # --- TAB 1: DASHBOARD ---
@@ -230,7 +218,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
         dashboard_top = [
             [f"Territory Analysis: {cong_name}"],
-            [f"Generated {datetime.datetime.now().strftime('%B %Y')} by Territory Analysis Engine."],
+            [f"Generated {run_timestamp.strftime('%B %Y')} by Territory Analysis Engine."],
             [""],
             [f"Total Territories: {total_territories}"],
             [f"Total Valid Addresses: {total_addresses}"],
@@ -243,18 +231,36 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ]
         pd.DataFrame(dashboard_top).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
         
-        ranges = ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"]
         distribution = []
-        for r in ranges:
-            rmin, rmax = [int(x) for x in r.split("-")]
-            count = len(counts_df[(counts_df['Total_Addresses'] >= rmin) & (counts_df['Total_Addresses'] <= rmax)])
-            cat = "Ideal" if rmin == min_goal else ("Undersized" if rmax <= min_goal else "Oversized")
-            distribution.append([cat, r, count])
+        if min_goal > 0:
+            under_count = len(counts_df[counts_df['Total_Addresses'] < min_goal])
+            distribution.append(["Undersized", f"Under {min_goal}", under_count])
             
+        ideal_count = len(counts_df[counts_df['Category'] == 'Ideal'])
+        distribution.append(["Ideal", f"{min_goal}-{max_goal}", ideal_count])
+        
+        current_floor = max_goal + 1
+        max_address_count = counts_df['Total_Addresses'].max() if total_territories > 0 else current_floor
+        
+        while current_floor <= max_address_count:
+            current_ceil = current_floor + 24
+            chunk_count = len(counts_df[(counts_df['Total_Addresses'] >= current_floor) & (counts_df['Total_Addresses'] <= current_ceil)])
+            if chunk_count > 0 or current_floor < 175:
+                distribution.append(["Oversized", f"{current_floor}-{current_ceil}", chunk_count])
+            current_floor += 25
+            
+        if current_floor < 175 and max_address_count < 175:
+            distribution.append(["Oversized", f"{current_floor} and over", 0])
+        elif max_address_count >= current_floor:
+            over_count = len(counts_df[counts_df['Total_Addresses'] >= current_floor])
+            distribution.append(["Oversized", f"{current_floor} and over", over_count])
+
         pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=11, index=False)
 
         ws1 = writer.sheets['Dashboard']
-        ws1.column_dimensions['A'].width = 15
+        ws1.column_dimensions['A'].width = 18
+        ws1.column_dimensions['B'].width = 25
+        ws1.column_dimensions['C'].width = 12
         
         ws1['A1'].font = Font(size=20, bold=True)
         ws1['A2'].hyperlink = "http://www.territoryanalysis.com/"
@@ -270,25 +276,62 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         header_fill = PatternFill(start_color="C7CDDB", end_color="C7CDDB", fill_type="solid")
         for col in range(1, 4):
             ws1.cell(row=12, column=col).fill = header_fill
+            ws1.cell(row=12, column=col).font = Font(bold=True)
 
-        for r in range(13, 19):
+        dist_end_row = 12 + len(distribution)
+        for r in range(13, dist_end_row + 1):
             if ws1.cell(row=r, column=1).value == "Ideal":
                 for col in range(1, 4):
                     ws1.cell(row=r, column=col).font = Font(bold=True)
 
-        ws1['A20'].value = CellRichText(["As a part of this analysis, every ", TextBlock(bold_inline, "address point"), " within your territory was collected & identified."])
-        ws1['A21'].value = "These addresses, with a little reformatting, can be added to NWS or other programs (Please see http://www.territoryanalysis.com/ to see if your system is supported.)"
-        ws1['A21'].hyperlink = "http://www.territoryanalysis.com/"
-        ws1['A21'].font = Font(color="0563C1", underline="single")
-        ws1['A22'].value = "It's suggested to export this file into a program you can easily edit, like excel or google sheets."
-        ws1['A23'].value = "That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible."
-        ws1['A24'].value = ""
-        ws1['A25'].value = CellRichText(["The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"])
-        ws1['A26'].value = CellRichText(["The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."])
-        ws1['A27'].value = CellRichText(["The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."])
-        ws1['A28'].value = CellRichText(["The ", TextBlock(bold_inline, "APARTMENTS"), " tab displays every multifamily above 5 units in your territory. Large units can be explanations for inflated door-to-door territories."])
-        ws1['A29'].value = CellRichText(["The ", TextBlock(bold_inline, "BORDER REWRITES"), " tab displays borders within your territory that may benefit from being redrawn. The intent is to shrink oversized territories adjacent to undersized territories. These are just suggestions."])
-        ws1['A30'].value = CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."])
+        instruct_start = max(20, dist_end_row + 2)
+        instructions = [
+            CellRichText(["As a part of this analysis, every ", TextBlock(bold_inline, "address point"), " within your territory was collected & identified."]),
+            "These addresses, with a little reformatting, can be added to NWS or other programs (Please see http://www.territoryanalysis.com/ to see if your system is supported.)",
+            "It's suggested to export this file into a program you can easily edit, like excel or google sheets.",
+            "That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
+            "",
+            CellRichText(["The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"]),
+            CellRichText(["The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."]),
+            CellRichText(["The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."]),
+            CellRichText(["The ", TextBlock(bold_inline, "APARTMENTS"), " tab displays every multifamily above 5 units in your territory. Large units can be explanations for inflated door-to-door territories."]),
+            CellRichText(["The ", TextBlock(bold_inline, "BORDER REWRITES"), " tab displays borders within your territory that may benefit from being redrawn. The intent is to shrink oversized territories adjacent to undersized territories. These are just suggestions."]),
+            CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."])
+        ]
+        
+        for i, text in enumerate(instructions):
+            cell = ws1.cell(row=instruct_start + i, column=1)
+            cell.value = text
+            if "http" in str(text):
+                cell.hyperlink = "http://www.territoryanalysis.com/"
+                cell.font = Font(color="0563C1", underline="single")
+
+        tech_start = instruct_start + len(instructions) + 2
+        ws1.cell(row=tech_start, column=1, value="Technical: Run Information").font = Font(bold=True, size=12)
+        ws1.cell(row=tech_start, column=1).fill = header_fill
+        ws1.cell(row=tech_start, column=2).fill = header_fill
+
+        tech_info = [
+            ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %I:%M:%S %p")),
+            ("Goal Range Setting", f"{min_goal}-{max_goal} addresses"),
+            ("Total Records Loaded", len(joined_gdf)),
+            ("Valid Addresses Assigned", len(valid_gdf)),
+            ("Excluded Address Count", len(excluded_gdf))
+        ]
+        
+        for i, (label, val) in enumerate(tech_info, start=1):
+            ws1.cell(row=tech_start + i, column=1, value=label).font = Font(bold=True)
+            ws1.cell(row=tech_start + i, column=2, value=val)
+
+        def add_excel_table(worksheet, df, table_name):
+            if df.empty: return
+            max_row, max_col = df.shape
+            col_letter = openpyxl.utils.get_column_letter(max_col)
+            table_ref = f"A1:{col_letter}{max_row + 1}"
+            tab = Table(displayName=table_name, ref=table_ref)
+            style = TableStyleInfo(name="TableStyleMedium9", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+            tab.tableStyleInfo = style
+            worksheet.add_table(tab)
 
         # --- TAB 2: COUNT PER TERRITORY ---
         counts_df_sorted = counts_df.sort_values(by='Territory_Name').rename(columns={
@@ -297,76 +340,50 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         })
         counts_df_sorted.to_excel(writer, sheet_name="Counts", index=False)
         ws2 = writer.sheets['Counts']
-        ws2.column_dimensions['A'].width = 15
+        ws2.column_dimensions['A'].width = 18
         ws2.column_dimensions['B'].width = 15
         ws2.column_dimensions['C'].width = 15
+        add_excel_table(ws2, counts_df_sorted, "CountsTable")
         
         for row in range(2, len(counts_df_sorted) + 2):
             ws2[f'B{row}'].alignment = Alignment(horizontal='center')
             cell = ws2[f'C{row}']
-            if cell.value == 'Ideal':
-                cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
-            elif cell.value == 'Undersized':
-                cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
-            elif cell.value == 'Oversized':
-                cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
+            if cell.value == 'Ideal': cell.fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid")
+            elif cell.value == 'Undersized': cell.fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")
+            elif cell.value == 'Oversized': cell.fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")
             cell.alignment = Alignment(horizontal='center')
 
         # --- TAB 3: ADDRESS LIST ---
         valid_gdf['Latitude'] = valid_gdf.geometry.y
         valid_gdf['Longitude'] = valid_gdf.geometry.x
-
         valid_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = valid_gdf["HouseNo"].apply(house_number_sort_parts)
         valid_gdf["Unit_Sort"] = valid_gdf["Unit"].map(clean_field).str.upper()
 
-        address_list_df = valid_gdf.sort_values(
-            by=[
-                "Territory_Name",
-                "Street",
-                "HouseNum_Sort",
-                "HouseNum_Suffix_Rank",
-                "HouseNum_Text_Sort",
-                "Unit_Sort",
-            ],
-            kind="stable",
-        )
+        address_list_df = valid_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
         
-        export_df = address_list_df[['Territory_Name', 'Mailable_Address', 'HouseNo', 'HouseSx', 'Street', 'Unit', 'Muni', 'Zip_Code', 'Latitude', 'Longitude']].rename(columns={
+        export_df = address_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'HouseNo', 'HouseSx', 'Street', 'Unit', 'Muni', 'Zip_Code', 'Latitude', 'Longitude']].rename(columns={
             'Territory_Name': 'Territory Name', 
             'Mailable_Address': 'Mailable Address'
         })
         export_df.to_excel(writer, sheet_name="Address List", index=False)
         
         ws3 = writer.sheets['Address List']
+        add_excel_table(ws3, export_df, "AddressListTable")
         
-        for col_letter in ['C', 'D', 'E', 'F', 'G', 'H', 'I', 'J']:
+        for col_letter in ['E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']:
             ws3.column_dimensions[col_letter].hidden = True
             
-        ws3.column_dimensions['A'].width = 15
-        ws3.column_dimensions['B'].width = 55
+        ws3.column_dimensions['A'].width = 18
+        ws3.column_dimensions['B'].width = 15
+        ws3.column_dimensions['C'].width = 15
+        ws3.column_dimensions['D'].width = 55
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
         apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Unit"]].copy()
-        apartment_source["_Unit_Normalized"] = (
-            apartment_source["Unit"]
-            .map(clean_field)
-            .str.upper()
-            .str.replace(r"\s+", " ", regex=True)
-            .str.strip()
-        )
-        apartment_source = apartment_source[
-            apartment_source["_Unit_Normalized"].ne("")
-            & apartment_source["Base_Address"].map(clean_field).ne("")
-        ].copy()
+        apartment_source["_Unit_Normalized"] = apartment_source["Unit"].map(clean_field).str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
+        apartment_source = apartment_source[apartment_source["_Unit_Normalized"].ne("") & apartment_source["Base_Address"].map(clean_field).ne("")].copy()
 
-        apt_groups = (
-            apartment_source.groupby(
-                ["Territory_Name", "Base_Address"],
-                observed=True,
-            )["_Unit_Normalized"]
-            .nunique()
-            .reset_index(name="Total Units")
-        )
+        apt_groups = apartment_source.groupby(["Territory_Name", "Base_Address"], observed=True)["_Unit_Normalized"].nunique().reset_index(name="Total Units")
         apt_groups = apt_groups[apt_groups["Total Units"] >= 5].copy()
         
         if not counts_df.empty:
@@ -387,108 +404,55 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             
         apt_export.to_excel(writer, sheet_name="Apartments", index=False)
         ws4 = writer.sheets['Apartments']
+        add_excel_table(ws4, apt_export, "ApartmentsTable")
+        
         ws4.column_dimensions['A'].width = 30
         ws4.column_dimensions['B'].width = 40
         ws4.column_dimensions['C'].width = 15
-        
-        for row in range(2, len(apt_export) + 2):
-            ws4[f'C{row}'].alignment = Alignment(horizontal='center')
+        for row in range(2, len(apt_export) + 2): ws4[f'C{row}'].alignment = Alignment(horizontal='center')
 
         # --- TAB 5: BORDER REWRITES ---
-        oversized = (
-            counts_df.loc[
-                counts_df["Category"].eq("Oversized"),
-                "Territory_Name",
-            ].tolist()
-            if not counts_df.empty
-            else []
-        )
+        oversized = counts_df.loc[counts_df["Category"].eq("Oversized"), "Territory_Name"].tolist() if not counts_df.empty else []
+        undersized = counts_df.loc[counts_df["Category"].eq("Undersized"), "Territory_Name"].tolist() if not counts_df.empty else []
 
-        undersized = (
-            counts_df.loc[
-                counts_df["Category"].eq("Undersized"),
-                "Territory_Name",
-            ].tolist()
-            if not counts_df.empty
-            else []
-        )
-
-        terr_geoms = (
-            kml_gdf[["Territory_Name", "geometry_terr"]]
-            .dropna(subset=["Territory_Name", "geometry_terr"])
-            .set_geometry("geometry_terr")
-            .dissolve(by="Territory_Name")
-        )
-
+        terr_geoms = kml_gdf[["Territory_Name", "geometry_terr"]].dropna(subset=["Territory_Name", "geometry_terr"]).set_geometry("geometry_terr").dissolve(by="Territory_Name")
         terr_geoms["geometry_terr"] = terr_geoms.geometry.make_valid()
-        terr_geoms = terr_geoms[
-            terr_geoms.geometry.notna()
-            & ~terr_geoms.geometry.is_empty
-        ].copy()
+        terr_geoms = terr_geoms[terr_geoms.geometry.notna() & ~terr_geoms.geometry.is_empty].copy()
 
-        count_lookup = (
-            counts_df.drop_duplicates("Territory_Name")
-            .set_index("Territory_Name")["Total_Addresses"]
-            .to_dict()
-        )
-
+        count_lookup = counts_df.drop_duplicates("Territory_Name").set_index("Territory_Name")["Total_Addresses"].to_dict()
         undersized_set = set(undersized)
         territory_sindex = terr_geoms.sindex
         suggestions = []
 
         for over_name in oversized:
-            if over_name not in terr_geoms.index:
-                continue
-
+            if over_name not in terr_geoms.index: continue
             over_geom = terr_geoms.at[over_name, "geometry_terr"]
             over_count = count_lookup.get(over_name, 0)
-
-            candidate_positions = territory_sindex.query(
-                over_geom,
-                predicate="intersects",
-            )
+            candidate_positions = territory_sindex.query(over_geom, predicate="intersects")
 
             for candidate_position in candidate_positions:
                 under_name = terr_geoms.index[candidate_position]
-
-                if under_name == over_name or under_name not in undersized_set:
-                    continue
-
+                if under_name == over_name or under_name not in undersized_set: continue
                 under_geom = terr_geoms.iloc[candidate_position].geometry_terr
-
-                if not over_geom.touches(under_geom):
-                    continue
-
-                shared_boundary = over_geom.boundary.intersection(
-                    under_geom.boundary
-                )
-
-                if shared_boundary.is_empty or shared_boundary.length <= 0:
-                    continue
-
+                if not over_geom.touches(under_geom): continue
+                shared_boundary = over_geom.boundary.intersection(under_geom.boundary)
+                if shared_boundary.is_empty or shared_boundary.length <= 0: continue
                 under_count = count_lookup.get(under_name, 0)
-
-                suggestions.append(
-                    [
-                        over_name,
-                        over_count,
-                        under_name,
-                        under_count,
-                        "",
-                    ]
-                )
+                suggestions.append([over_name, over_count, under_name, under_count, ""])
                         
-        pd.DataFrame(suggestions, columns=["Too Large", "Count", "Too Small", "Count ", "Recommendation"]).to_excel(writer, sheet_name="Border Rewrites", index=False)
+        sugg_df = pd.DataFrame(suggestions, columns=["Too Large", "Count", "Too Small", "Count ", "Recommendation"])
+        sugg_df.to_excel(writer, sheet_name="Border Rewrites", index=False)
         ws5 = writer.sheets['Border Rewrites']
-        ws5.column_dimensions['A'].width = 15
-        ws5.column_dimensions['C'].width = 15
+        add_excel_table(ws5, sugg_df, "BorderRewritesTable")
+        
+        ws5.column_dimensions['A'].width = 18
+        ws5.column_dimensions['C'].width = 18
         ws5.column_dimensions['E'].width = 85
 
         for r in range(2, len(suggestions) + 2):
             diff = abs(suggestions[r-2][1] - suggestions[r-2][3])
             ws5.cell(row=r, column=5).value = CellRichText([
-                "That is a ",
-                TextBlock(bold_inline, f"{diff} address difference"),
+                "That is a ", TextBlock(bold_inline, f"{diff} address difference"),
                 f". Shrink {suggestions[r-2][0]} & Expand {suggestions[r-2][2]}."
             ])
 
@@ -496,47 +460,34 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         if not excluded_gdf.empty:
             excluded_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = excluded_gdf["HouseNo"].apply(house_number_sort_parts)
             excluded_gdf["Unit_Sort"] = excluded_gdf["Unit"].map(clean_field).str.upper()
+            excluded_list_df = excluded_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
             
-            excluded_list_df = excluded_gdf.sort_values(
-                by=[
-                    "Territory_Name",
-                    "Street",
-                    "HouseNum_Sort",
-                    "HouseNum_Suffix_Rank",
-                    "HouseNum_Text_Sort",
-                    "Unit_Sort",
-                ],
-                kind="stable",
-            )
-            
-            export_ex_df = excluded_list_df[['Territory_Name', 'Mailable_Address', 'Addr_Statu', 'HouseNo', 'Street', 'Unit', 'Zip_Code']].rename(columns={
+            export_ex_df = excluded_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'Addr_Statu', 'HouseNo', 'Street', 'Unit', 'Zip_Code']].rename(columns={
                 'Territory_Name': 'Territory Name', 
                 'Mailable_Address': 'Mailable Address'
             })
             export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
             
             ws6 = writer.sheets['Excluded Audit']
-            ws6.column_dimensions['D'].hidden = True
-            ws6.column_dimensions['E'].hidden = True
-            ws6.column_dimensions['F'].hidden = True
-            ws6.column_dimensions['G'].hidden = True
-            ws6.column_dimensions['A'].width = 15
-            ws6.column_dimensions['B'].width = 55
-            ws6.column_dimensions['C'].width = 28
+            add_excel_table(ws6, export_ex_df, "ExcludedAuditTable")
+            
+            for col_letter in ['F', 'G', 'H', 'I']:
+                ws6.column_dimensions[col_letter].hidden = True
+                
+            ws6.column_dimensions['A'].width = 18
+            ws6.column_dimensions['B'].width = 15
+            ws6.column_dimensions['C'].width = 15
+            ws6.column_dimensions['D'].width = 55
+            ws6.column_dimensions['E'].width = 28
         else:
             pd.DataFrame(columns=["Notice"]).to_excel(writer, sheet_name="Excluded Audit", index=False)
             writer.sheets['Excluded Audit'].cell(row=2, column=1, value="No addresses were excluded in this map area.")
 
-        # --- EXCEL UX POLISH (FREEZE PANES & BOLD HEADERS) ---
-        tabs_to_format = ["Counts", "Address List", "Apartments", "Border Rewrites", "Excluded Audit"]
-        for tab_name in tabs_to_format:
+        # --- EXCEL UX POLISH ---
+        for tab_name in ["Counts", "Address List", "Apartments", "Border Rewrites", "Excluded Audit"]:
             ws = writer.sheets[tab_name]
             ws.freeze_panes = 'A2'
-            for cell in ws[1]:
-                cell.font = Font(bold=True)
-                cell.alignment = Alignment(wrap_text=True, horizontal=cell.alignment.horizontal if cell.alignment else 'left')
 
-        # Tab colorization
         writer.sheets['Dashboard'].sheet_properties.tabColor = "1E90FF"
         writer.sheets['Counts'].sheet_properties.tabColor = "32CD32"
         writer.sheets['Address List'].sheet_properties.tabColor = "32CD32"
