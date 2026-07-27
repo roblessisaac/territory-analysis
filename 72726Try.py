@@ -457,7 +457,19 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             if over_name not in terr_geoms.index: continue
             over_geom = terr_geoms.at[over_name, "geometry_terr"]
             over_count = count_lookup.get(over_name, 0)
-            candidate_positions = territory_sindex.query(over_geom, predicate="intersects")
+            
+            # Artificially expand the border by ~50 feet to bridge hand-drawn KML gaps/overlaps
+            proximity_zone = over_geom.buffer(0.00015)
+            
+            candidate_positions = territory_sindex.query(proximity_zone, predicate="intersects")
+
+            for candidate_position in candidate_positions:
+                under_name = terr_geoms.index[candidate_position]
+                if under_name == over_name or under_name not in undersized_set: continue
+                
+                # If they fall in the proximity zone, they are neighbors. No strict topological checks needed.
+                under_count = count_lookup.get(under_name, 0)
+                suggestions.append([over_name, over_count, under_name, under_count, ""])
 
             for candidate_position in candidate_positions:
                 under_name = terr_geoms.index[candidate_position]
