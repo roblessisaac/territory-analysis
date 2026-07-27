@@ -165,15 +165,179 @@ def evaluate_data_quality(row):
     base_address = clean_field(row.get("Base_Address"))
     mailable_address = clean_field(row.get("Mailable_Address"))
 
-    if not street: issues.append("Missing Street")
-    if not municipality: issues.append("Missing Municipality")
-    if not zip_code: issues.append("Missing ZIP")
-    if house and re.fullmatch(r"[+-]?0+(?:\.0+)?", house): issues.append("Zero House Number")
+    if not street:
+        issues.append("Missing Street")
+    if not municipality:
+        issues.append("Missing Municipality")
+    if not zip_code:
+        issues.append("Missing ZIP")
+    if house and re.fullmatch(r"[+-]?0+(?:\.0+)?", house):
+        issues.append("Zero House Number")
 
-    zip_is_valid = not zip_code or bool(re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code))
-    if not house or not base_address or not mailable_address or ",," in base_address or ",," in mailable_address or not zip_is_valid:
+    zip_is_valid = not zip_code or bool(
+        re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code)
+    )
+    if (
+        not house
+        or not base_address
+        or not mailable_address
+        or ",," in base_address
+        or ",," in mailable_address
+        or not zip_is_valid
+    ):
         issues.append("Malformed Address")
+
     return " | ".join(issues)
+
+
+def parse_house_number_components(full_house_number):
+    text = normalize_house_number(full_house_number).upper()
+    if not text:
+        return "", "", ""
+
+    text = re.sub(r"\s+", " ", text).strip()
+    directional_prefix = ""
+    house_number_main = ""
+    house_suffix = ""
+
+    directional_match = re.fullmatch(
+        r"([NSEW])\s*(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
+        text,
+    )
+    if directional_match:
+        directional_prefix, house_number_main, house_suffix = (
+            directional_match.groups()
+        )
+        return directional_prefix, house_number_main, house_suffix
+
+    standard_match = re.fullmatch(
+        r"(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
+        text,
+    )
+    if standard_match:
+        house_number_main, house_suffix = standard_match.groups()
+        return "", house_number_main, house_suffix
+
+    numeric_match = re.search(r"\d+(?:\s+\d+/\d+|\.\d+)?", text)
+    if numeric_match:
+        house_number_main = numeric_match.group(0)
+        prefix_text = text[:numeric_match.start()].strip()
+        suffix_text = text[numeric_match.end():].strip()
+        if prefix_text in {"N", "S", "E", "W"}:
+            directional_prefix = prefix_text
+        if re.fullmatch(r"[A-Z]", suffix_text):
+            house_suffix = suffix_text
+
+    return directional_prefix, house_number_main, house_suffix
+
+
+def parse_mailable_address(row, state):
+    mailable_address = clean_field(row.get("Mailable_Address"))
+    address_parts = [part.strip() for part in mailable_address.split(",")]
+
+    street_line = address_parts[0] if address_parts else ""
+    municipality = (
+        address_parts[1]
+        if len(address_parts) > 1
+        else clean_field(row.get("Canonical_Muni"))
+    )
+    state_zip = address_parts[2] if len(address_parts) > 2 else ""
+
+    state_value = state
+    zip_code = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    state_zip_match = re.fullmatch(
+        r"([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?",
+        state_zip,
+    )
+    if state_zip_match:
+        state_value = state_zip_match.group(1).upper()
+        if state_zip_match.group(2):
+            zip_code = state_zip_match.group(2)
+
+    unit_type = ""
+    unit_value = clean_field(row.get("Canonical_Unit"))
+    normalized_unit = normalize_unit(unit_value)
+    if normalized_unit:
+        unit_match = re.match(
+            r"^(APT(?:ARTMENT)?|UNIT|STE|SUITE|UPPER|LOWER|BSMT|BASEMENT|"
+            r"REAR|FRONT|FLOOR|FL|BUILDING|BLDG|ROOM|RM)\b\s*(.*)$",
+            normalized_unit,
+            flags=re.IGNORECASE,
+        )
+        if unit_match:
+            unit_type = unit_match.group(1).upper()
+            unit_value = unit_match.group(2).strip()
+        else:
+            unit_value = normalized_unit
+
+    street_without_unit = street_line
+    if normalized_unit:
+        unit_suffix_pattern = re.compile(
+            rf"\s+{re.escape(normalized_unit)}$",
+            flags=re.IGNORECASE,
+        )
+        street_without_unit = unit_suffix_pattern.sub("", street_line).strip()
+
+    full_house_number = (
+        f"{normalize_house_number(row.get('Canonical_HouseNo'))}"
+        f"{clean_field(row.get('Canonical_HouseSx'))}"
+    ).strip()
+    if not full_house_number:
+        house_match = re.match(r"^(\S+)\s+(.*)$", street_without_unit)
+        if house_match:
+            full_house_number = house_match.group(1)
+
+    house_prefix, house_main, house_suffix = parse_house_number_components(
+        full_house_number
+    )
+
+    street_prefix = clean_field(row.get("Canonical_Dir")).upper()
+    street_name = clean_field(row.get("Canonical_Street"))
+    street_type = clean_field(row.get("Canonical_StType")).upper()
+    full_street = " ".join(
+        part for part in [street_prefix, street_name, street_type] if part
+    )
+
+    if not full_street and street_without_unit:
+        remaining_street = street_without_unit
+        if full_house_number and remaining_street.upper().startswith(
+            full_house_number.upper()
+        ):
+            remaining_street = remaining_street[len(full_house_number):].strip()
+
+        street_match = re.fullmatch(
+            r"(?:(N|S|E|W|NE|NW|SE|SW)\s+)?(.+?)"
+            r"(?:\s+(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|"
+            r"LN|LANE|CT|COURT|PL|PLACE|PKWY|PARKWAY|HWY|HIGHWAY|WAY|TER|"
+            r"TERRACE|CIR|CIRCLE))?",
+            remaining_street,
+            flags=re.IGNORECASE,
+        )
+        if street_match:
+            street_prefix = clean_field(street_match.group(1)).upper()
+            street_name = clean_field(street_match.group(2))
+            street_type = clean_field(street_match.group(3)).upper()
+            full_street = " ".join(
+                part for part in [street_prefix, street_name, street_type] if part
+            )
+
+    return pd.Series(
+        {
+            "FullHouNumber": full_house_number,
+            "FullStreet": full_street,
+            "Municipality": municipality,
+            "State": state_value,
+            "ZipCode": zip_code,
+            "HouseNoPrefix": house_prefix,
+            "HouseNoMain": house_main,
+            "HouseSx": house_suffix,
+            "StreetPrefixDir": street_prefix,
+            "StreetName": street_name,
+            "StreetType": street_type,
+            "UnitType": unit_type,
+            "Unit": unit_value,
+        }
+    )
 
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, county_config, apt_threshold, kml_filename, county_filename):
@@ -358,18 +522,28 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             ("Records Flagged with Warnings", flagged_record_count),
             ("KML Filename", kml_filename),
             ("County Source Filename", county_filename),
+            ("Duplicate Boundary Assignments", ""),
+            ("Unassigned Address Records", ""),
+            ("Workbook Schema Version", ""),
         ]
 
         for offset, (label, value) in enumerate(tech_info, start=1):
             row_number = technical_start + offset
-            ws1.merge_cells(start_row=row_number, start_column=1, end_row=row_number, end_column=2)
+            ws1.merge_cells(
+                start_row=row_number,
+                start_column=1,
+                end_row=row_number,
+                end_column=2,
+            )
             label_cell = ws1.cell(row=row_number, column=1, value=label)
             value_cell = ws1.cell(row=row_number, column=3, value=value)
-            
+
             label_cell.font = Font(bold=False)
             value_cell.font = Font(bold=False)
             label_cell.alignment = Alignment(wrap_text=True, vertical="top")
-            value_cell.alignment = Alignment(wrap_text=True, vertical="top")
+            value_cell.alignment = Alignment(wrap_text=False, vertical="top")
+
+        ws1.column_dimensions["C"].width = 28
 
         def add_excel_table(worksheet, dataframe, table_name, show_stripes=False):
             if dataframe.empty: return
@@ -380,68 +554,302 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             worksheet.add_table(tab)
 
         # --- TAB 2: COUNTS ---
-        apartment_units_by_territory = apt_groups.groupby("Territory_Name", observed=True)["Total Units"].sum().reset_index(name="# of Apartment Units")
-        counts_df_sorted = counts_df.merge(apartment_units_by_territory, on="Territory_Name", how="left")
-        counts_df_sorted["# of Apartment Units"] = counts_df_sorted["# of Apartment Units"].fillna(0).astype(int)
-        
-        counts_df_sorted = counts_df_sorted.sort_values(by="Territory_Name").rename(columns={
-            "Territory_Name": "Territory Name", "Total_Addresses": "# of Addresses", "Category": "Status"
-        })[["Territory Name", "# of Addresses", "# of Apartment Units", "Status"]]
+        apartment_units_by_territory = (
+            apt_groups.groupby("Territory_Name", observed=True)["Total Units"]
+            .sum()
+            .reset_index(name="# of Apartment Units")
+        )
+        counts_df_sorted = counts_df.merge(
+            apartment_units_by_territory,
+            on="Territory_Name",
+            how="left",
+        )
+        counts_df_sorted["# of Apartment Units"] = (
+            counts_df_sorted["# of Apartment Units"]
+            .fillna(0)
+            .astype(int)
+        )
+        counts_df_sorted["Addresses With Apartments Removed"] = (
+            counts_df_sorted["Total_Addresses"]
+            - counts_df_sorted["# of Apartment Units"]
+        ).clip(lower=0)
+        counts_df_sorted["Potential Status"] = counts_df_sorted[
+            "Addresses With Apartments Removed"
+        ].apply(get_category)
 
-        counts_df_sorted.to_excel(writer, sheet_name="Counts", index=False)
+        suggested_actions = {
+            ("Oversized", "Ideal"): (
+                "Consider turning apartment units into letter writing"
+            ),
+            ("Ideal", "Undersized"): (
+                "This is an apartment heavy territory. If you intend on "
+                "transforming apartments into letter writing, consider a "
+                "border adjustment to add more door-to-door territory."
+            ),
+            ("Oversized", "Undersized"): (
+                "Consider turning some (but not all) apartment units into "
+                "letter writing, or consider a border adjustment"
+            ),
+            ("Ideal", "Ideal"): "No action needed",
+            ("Undersized", "Undersized"): (
+                "Consider a border adjustment to add more door-to-door territory"
+            ),
+            ("Oversized", "Oversized"): (
+                "Consider a border adjustment to subtract the amount of "
+                "door-to-door needed to cover the territory"
+            ),
+            ("Undersized", "Ideal"): "This is impossible.",
+            ("Ideal", "Oversized"): "This is impossible.",
+            ("Undersized", "Oversized"): "This is impossible.",
+        }
+        counts_df_sorted["Suggested Action"] = counts_df_sorted.apply(
+            lambda row: suggested_actions.get(
+                (row["Category"], row["Potential Status"]),
+                "Review territory manually",
+            ),
+            axis=1,
+        )
+
+        counts_df_sorted = (
+            counts_df_sorted.sort_values(by="Territory_Name")
+            .rename(
+                columns={
+                    "Territory_Name": "Territory Name",
+                    "Total_Addresses": "# of Addresses",
+                    "Category": "Current Status",
+                }
+            )[
+                [
+                    "Territory Name",
+                    "# of Addresses",
+                    "Current Status",
+                    "# of Apartment Units",
+                    "Addresses With Apartments Removed",
+                    "Potential Status",
+                    "Suggested Action",
+                ]
+            ]
+        )
+
+        counts_df_sorted.to_excel(
+            writer,
+            sheet_name="Counts",
+            index=False,
+        )
         ws2 = writer.sheets["Counts"]
 
-        for column_letter in ["A", "B", "C", "D"]: ws2.column_dimensions[column_letter].width = 22
-        
-        # Adding table with stripes OFF as requested
-        add_excel_table(ws2, counts_df_sorted, "CountsTable", show_stripes=False)
+        counts_widths = {
+            "A": 22,
+            "B": 22,
+            "C": 22,
+            "D": 22,
+            "E": 28,
+            "F": 22,
+            "G": 62,
+        }
+        for column_letter, width in counts_widths.items():
+            ws2.column_dimensions[column_letter].width = width
 
-        undersized_oversized_status_fill = PatternFill(start_color="EA9D9C", end_color="EA9D9C", fill_type="solid")
-        undersized_oversized_data_fill = PatternFill(start_color="DFC2D0", end_color="DFC2D0", fill_type="solid")
-        ideal_status_fill = PatternFill(start_color="C5EFCF", end_color="C5EFCF", fill_type="solid")
-        ideal_data_fill = PatternFill(start_color="E5F2E0", end_color="E5F2E0", fill_type="solid")
+        add_excel_table(
+            ws2,
+            counts_df_sorted,
+            "CountsTable",
+            show_stripes=False,
+        )
+
+        red_status_fill = PatternFill(
+            start_color="EA9D9C",
+            end_color="EA9D9C",
+            fill_type="solid",
+        )
+        red_data_fill = PatternFill(
+            start_color="DFC2D0",
+            end_color="DFC2D0",
+            fill_type="solid",
+        )
+        green_status_fill = PatternFill(
+            start_color="C5EFCF",
+            end_color="C5EFCF",
+            fill_type="solid",
+        )
+        green_data_fill = PatternFill(
+            start_color="E5F2E0",
+            end_color="E5F2E0",
+            fill_type="solid",
+        )
+
+        for cell in ws2[1]:
+            cell.font = Font(bold=True, color="000000")
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+
+        def status_fill(status, status_cell=True):
+            if status == "Ideal":
+                return green_status_fill if status_cell else green_data_fill
+            return red_status_fill if status_cell else red_data_fill
 
         for row_number in range(2, len(counts_df_sorted) + 2):
-            status = ws2.cell(row=row_number, column=4).value
-            for column_number in range(1, 5):
-                cell = ws2.cell(row=row_number, column=column_number)
-                cell.font = Font(bold=True, color="000000")
-                cell.alignment = Alignment(wrap_text=column_number == 1, vertical="center", horizontal=("left" if column_number == 1 else "center"))
+            current_status = ws2.cell(row=row_number, column=3).value
+            potential_status = ws2.cell(row=row_number, column=6).value
 
-            if status in {"Undersized", "Oversized"}:
-                for column_number in range(1, 4): ws2.cell(row=row_number, column=column_number).fill = undersized_oversized_data_fill
-                ws2.cell(row=row_number, column=4).fill = undersized_oversized_status_fill
-            elif status == "Ideal":
-                for column_number in range(1, 4): ws2.cell(row=row_number, column=column_number).fill = ideal_data_fill
-                ws2.cell(row=row_number, column=4).fill = ideal_status_fill
+            for column_number in range(1, 8):
+                cell = ws2.cell(row=row_number, column=column_number)
+                cell.font = Font(bold=False, color="000000")
+                cell.alignment = Alignment(
+                    horizontal=("left" if column_number in {1, 7} else "center"),
+                    vertical="center",
+                    wrap_text=column_number in {1, 5, 7},
+                )
+
+            for column_number in {1, 2, 4, 5, 7}:
+                ws2.cell(row=row_number, column=column_number).fill = status_fill(
+                    current_status,
+                    status_cell=False,
+                )
+
+            ws2.cell(row=row_number, column=3).fill = status_fill(
+                current_status,
+                status_cell=True,
+            )
+            ws2.cell(row=row_number, column=6).fill = status_fill(
+                potential_status,
+                status_cell=True,
+            )
 
         # --- TAB 3: ADDRESS LIST ---
         valid_gdf["Latitude"] = valid_gdf.geometry.y
         valid_gdf["Longitude"] = valid_gdf.geometry.x
-        valid_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = valid_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
-        valid_gdf["Unit_Sort"] = valid_gdf["Canonical_Unit"].map(clean_field).str.upper()
+        valid_gdf[
+            [
+                "HouseNum_Sort",
+                "HouseNum_Suffix_Rank",
+                "HouseNum_Text_Sort",
+            ]
+        ] = valid_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
+        valid_gdf["Unit_Sort"] = (
+            valid_gdf["Canonical_Unit"].map(clean_field).str.upper()
+        )
 
-        address_list_df = valid_gdf.sort_values(by=["Territory_Name", "Canonical_Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
-        
-        export_df = address_list_df[[
-            "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Data_Quality_Flag",
-            "Canonical_HouseNo", "Canonical_HouseSx", "Canonical_Street", "Canonical_Unit", "Canonical_Muni", "Canonical_Zip_Code", "Latitude", "Longitude"
-        ]].rename(columns={
-            "Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", "Data_Quality_Flag": "Data Quality Flag",
-            "Canonical_HouseNo": "HouseNo", "Canonical_HouseSx": "HouseSx", "Canonical_Street": "Street", "Canonical_Unit": "Unit", "Canonical_Muni": "Muni", "Canonical_Zip_Code": "Zip_Code"
-        })
+        address_list_df = valid_gdf.sort_values(
+            by=[
+                "Territory_Name",
+                "Canonical_Street",
+                "HouseNum_Sort",
+                "HouseNum_Suffix_Rank",
+                "HouseNum_Text_Sort",
+                "Unit_Sort",
+            ],
+            kind="stable",
+        ).copy()
 
-        export_df.to_excel(writer, sheet_name="Address List", index=False)
+        parsed_address_df = address_list_df.apply(
+            lambda row: parse_mailable_address(row, state),
+            axis=1,
+        )
+        address_list_df = pd.concat(
+            [address_list_df, parsed_address_df],
+            axis=1,
+        )
+
+        export_df = address_list_df[
+            [
+                "Territory_Name",
+                "Mailable_Address",
+                "FullHouNumber",
+                "FullStreet",
+                "Municipality",
+                "State",
+                "ZipCode",
+                "HouseNoPrefix",
+                "HouseNoMain",
+                "HouseSx",
+                "StreetPrefixDir",
+                "StreetName",
+                "StreetType",
+                "UnitType",
+                "Unit",
+                "Latitude",
+                "Longitude",
+                "Source_Record_ID",
+                "Data_Quality_Flag",
+            ]
+        ].rename(
+            columns={
+                "Territory_Name": "Territory Name",
+                "Mailable_Address": "Mailable Address",
+                "Source_Record_ID": "Source record ID",
+                "Data_Quality_Flag": "Data Quality Flag",
+            }
+        )
+
+        export_df.to_excel(
+            writer,
+            sheet_name="Address List",
+            index=False,
+        )
         ws3 = writer.sheets["Address List"]
-        add_excel_table(ws3, export_df, "AddressListTable", show_stripes=True)
+        add_excel_table(
+            ws3,
+            export_df,
+            "AddressListTable",
+            show_stripes=False,
+        )
 
-        for column_letter in ["G", "H", "I", "J", "K", "L", "M", "N"]: ws3.column_dimensions[column_letter].hidden = True
-        ws3.column_dimensions["A"].width = 22
-        ws3.column_dimensions["B"].width = 18
-        ws3.column_dimensions["C"].width = 15
-        ws3.column_dimensions["D"].width = 15
-        ws3.column_dimensions["E"].width = 55
-        ws3.column_dimensions["F"].width = 35
+        hidden_address_columns = [
+            "C",
+            "D",
+            "E",
+            "F",
+            "G",
+            "H",
+            "I",
+            "J",
+            "K",
+            "L",
+            "M",
+            "N",
+            "O",
+            "P",
+            "Q",
+            "R",
+        ]
+        for column_letter in hidden_address_columns:
+            ws3.column_dimensions[column_letter].hidden = True
+
+        ws3.column_dimensions["A"].width = 20
+        ws3.column_dimensions["B"].width = 55
+        ws3.column_dimensions["S"].width = 38
+
+        for cell in ws3[1]:
+            cell.font = Font(bold=True, color="000000")
+            cell.fill = PatternFill(fill_type=None)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+
+        quality_warning_fill = PatternFill(
+            start_color="EA9F9D",
+            end_color="EA9F9D",
+            fill_type="solid",
+        )
+        quality_flag_column = export_df.columns.get_loc("Data Quality Flag") + 1
+
+        for row_number in range(2, len(export_df) + 2):
+            quality_flag = ws3.cell(
+                row=row_number,
+                column=quality_flag_column,
+            ).value
+            if clean_field(quality_flag):
+                for column_number in range(1, len(export_df.columns) + 1):
+                    ws3.cell(
+                        row=row_number,
+                        column=column_number,
+                    ).fill = quality_warning_fill
 
         # --- TAB 4: APARTMENTS ---
         if not counts_df.empty:
@@ -578,12 +986,12 @@ if uploaded_kml != st.session_state["last_uploaded_kml"]:
 if uploaded_kml:
     if st.button("Generate Territory Analysis"):
         status_placeholder = st.empty()
-        status_placeholder.info("Territory Analysis engine started running...")
+        status_placeholder.info("Analysis engine stops for coffee…")
         
         parcel_gdf = load_county_data(selected_county)
 
         if parcel_gdf is not None:
-            status_placeholder.info("Analysis engine breaks into car groups...")
+            status_placeholder.info("Analysis engine gets a new call…")
             
             county_config = COUNTY_CONFIGS[selected_county]
             parcel_gdf = parcel_gdf.reset_index(drop=True).copy()
@@ -612,7 +1020,7 @@ if uploaded_kml:
                 duplicate_sequence = (parcel_gdf.groupby("Source_Record_ID").cumcount() + 1).astype(str)
                 parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] = parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] + "-DUP-" + duplicate_sequence.loc[duplicate_native_ids]
 
-            status_placeholder.info("Analysis engine arrives to the territory...")
+            status_placeholder.info("Analysis engine makes a return visit…")
 
             try:
                 kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
@@ -646,13 +1054,7 @@ if uploaded_kml:
 
                 joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
                 joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
-                
-                status_placeholder.info(random.choice([
-                    "Analysis engine needs a coffee break...",
-                    "Analysis engine gets a new call...",
-                    "Analysis engine makes a return visit...",
-                    "Analysis engine stamps a letter..."
-                ]))
+                status_placeholder.info("Analysis engine stamps a letter…")
 
                 duplicate_assignment_count = joined_gdf.duplicated(subset=["Source_Record_ID"], keep="first").sum()
                 joined_gdf = joined_gdf.drop_duplicates(subset=["Source_Record_ID"], keep="first").copy()
@@ -664,14 +1066,27 @@ if uploaded_kml:
                 if duplicate_assignment_count > 0:
                     st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
 
-                status_placeholder.info("Analysis engine is wrapping up the territory...")
+                status_placeholder.info(random.choice([
+                    "Analysis engine stops for coffee…",
+                    "Analysis engine gets a new call…",
+                    "Analysis engine makes a return visit…",
+                    "Analysis engine stamps a letter…",
+                ]))
 
                 excel_file = generate_excel_report(
                     joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""), 
                     county_config, apt_threshold=apartment_threshold, kml_filename=uploaded_kml.name, county_filename=county_config["file_path"]
                 )
                 
-                filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
+                safe_congregation_name = re.sub(
+                    r"[^A-Za-z0-9_-]+",
+                    "",
+                    congregation_name.replace(" ", ""),
+                ) or "Congregation"
+                filename = (
+                    f"{safe_congregation_name}-TerritoryAnalysis-"
+                    f"{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx"
+                )
                 st.session_state["excel_data"] = excel_file.getvalue()
                 st.session_state["excel_filename"] = filename
                 
