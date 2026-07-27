@@ -9,6 +9,7 @@ import fiona
 import io
 import datetime
 import re
+from fractions import Fraction
 
 # Enable KML support in GeoPandas
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
@@ -49,38 +50,143 @@ def load_county_data(county_name):
 def natural_keys(text):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text))]
 
-# --- ADDRESS BUILDER ---
-def build_addresses(row):
-    house = str(row['HouseNo']).replace('.0', '').strip() if pd.notna(row['HouseNo']) and str(row['HouseNo']).lower() != "nan" else ""
-    house_sx = str(row['HouseSx']).strip() if pd.notna(row['HouseSx']) and str(row['HouseSx']).lower() != "nan" else ""
-    direction = str(row['Dir']).strip() if pd.notna(row['Dir']) and str(row['Dir']).lower() != "nan" else ""
-    street = str(row['Street']).strip() if pd.notna(row['Street']) and str(row['Street']).lower() != "nan" else ""
-    st_type = str(row['StType']).strip() if pd.notna(row['StType']) and str(row['StType']).lower() != "nan" else ""
-    muni = str(row['Muni']).strip() if pd.notna(row['Muni']) and str(row['Muni']).lower() != "nan" else ""
-    zip_c = str(row['Zip_Code']).strip() if pd.notna(row['Zip_Code']) and str(row['Zip_Code']).lower() != "nan" else ""
+# --- ADDRESS BUILDER + NORMALIZATION HELPERS ---
+def clean_field(value):
+    """Convert null-like values to an empty string without altering valid text."""
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    return text
+
+def normalize_house_number(value):
+    """Preserve fractional and alphanumeric house numbers while removing spreadsheet artifacts."""
+    text = clean_field(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"[+-]?\d+\.0+", text):
+        return text.split(".", 1)[0]
+    return re.sub(r"\s+", " ", text)
+
+def normalize_zip_code(value):
+    """Normalize ZIP and ZIP+4 values while preserving leading zeros."""
+    text = clean_field(value)
+    if not text:
+        return ""
+    text = re.sub(r"\.0+$", "", text)
+    digits = re.sub(r"\D", "", text)
     
-    unit_val = str(row['Unit']).strip() if pd.notna(row['Unit']) and str(row['Unit']).lower() != "nan" else ""
-    unit_str = f" Apt {unit_val}" if unit_val else ""
+    if not digits:
+        return ""
+    if len(digits) == 4:
+        digits = digits.zfill(5)
+    elif len(digits) == 8:
+        digits = digits.zfill(9)
 
-    full_house_num = f"{house}{house_sx}"
+    if len(digits) == 5:
+        return digits
+    if len(digits) == 9:
+        return f"{digits[:5]}-{digits[5:]}"
+    if len(digits) > 9:
+        digits = digits[:9]
+        return f"{digits[:5]}-{digits[5:]}"
+    return digits
+
+def normalize_unit(value):
+    """Preserve descriptive unit labels. Add 'Apt' only for bare unit identifiers."""
+    text = clean_field(value)
+    if not text:
+        return ""
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    text = re.sub(r"\s+", " ", text).strip()
+
+    descriptive_pattern = re.compile(
+        r"^(?:"
+        r"apt(?:artment)?|"
+        r"unit|"
+        r"ste|suite|"
+        r"upper|lower|"
+        r"bsmt|basement|"
+        r"rear|front|"
+        r"floor|fl|"
+        r"building|bldg|"
+        r"room|rm"
+        r")\b",
+        flags=re.IGNORECASE,
+    )
+
+    if descriptive_pattern.search(text):
+        return text
+    return f"Apt {text}"
+
+def house_number_sort_parts(value):
+    """Produce stable sorting components for integer, decimal, fractional, hyphenated, and alphanumeric house numbers."""
+    text = normalize_house_number(value).upper()
+    if not text:
+        return pd.Series([float("inf"), 9, ""])
+    compact = re.sub(r"\s+", " ", text).strip()
+
+    mixed_fraction = re.match(r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$", compact)
+    if mixed_fraction:
+        whole, numerator, denominator, suffix = mixed_fraction.groups()
+        try:
+            numeric_value = int(whole) + float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float(int(whole))
+        return pd.Series([numeric_value, 1, suffix.strip()])
+
+    simple_fraction = re.match(r"^(\d+)\s*/\s*(\d+)(.*)$", compact)
+    if simple_fraction:
+        numerator, denominator, suffix = simple_fraction.groups()
+        try:
+            numeric_value = float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float("inf")
+        return pd.Series([numeric_value, 1, suffix.strip()])
+
+    numeric_prefix = re.match(r"^(\d+(?:\.\d+)?)(.*)$", compact)
+    if numeric_prefix:
+        number, suffix = numeric_prefix.groups()
+        suffix = suffix.strip()
+        suffix_rank = 0 if not suffix else 2
+        return pd.Series([float(number), suffix_rank, suffix])
+
+    return pd.Series([float("inf"), 8, compact])
+
+def build_addresses(row):
+    house = normalize_house_number(row.get("HouseNo"))
+    house_sx = clean_field(row.get("HouseSx"))
+    direction = clean_field(row.get("Dir"))
+    street = clean_field(row.get("Street"))
+    st_type = clean_field(row.get("StType"))
+    muni = clean_field(row.get("Muni"))
+    zip_c = normalize_zip_code(row.get("Zip_Code"))
+    unit_str = normalize_unit(row.get("Unit"))
+
+    full_house_num = f"{house}{house_sx}".strip()
     street_parts = [direction, street, st_type]
-    full_street = " ".join([p for p in street_parts if p])
+    full_street = " ".join(part for part in street_parts if part)
+    base_addr_line = " ".join(part for part in [full_house_num, full_street] if part)
 
-    base_addr_line = f"{full_house_num} {full_street}".strip()
-    base_addr = f"{base_addr_line}, {muni}, WI {zip_c}".replace(" ,", ",").strip(" ,")
+    locality_parts = [muni, "WI"]
+    locality = ", ".join(part for part in locality_parts if part)
+    if zip_c:
+        locality = f"{locality} {zip_c}".strip()
 
-    mailable_addr_line = f"{base_addr_line}{unit_str}".strip()
-    mailable_addr = f"{mailable_addr_line}, {muni}, WI {zip_c}".replace(" ,", ",").strip(" ,")
+    base_addr = ", ".join(part for part in [base_addr_line, locality] if part)
+    mailable_addr_line = " ".join(part for part in [base_addr_line, unit_str] if part)
+    mailable_addr = ", ".join(part for part in [mailable_addr_line, locality] if part)
 
-    return pd.Series([base_addr, mailable_addr])
-
+    return pd.Series([base_addr, mailable_addr], index=["Base_Address", "Mailable_Address"])
 
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
     
-    joined_gdf['Zip_Code'] = joined_gdf['Zip_Code'].astype(str).str[:5]
-    joined_gdf[['Base_Address', 'Mailable_Address']] = joined_gdf.apply(build_addresses, axis=1)
+    joined_gdf["Zip_Code"] = joined_gdf["Zip_Code"].map(normalize_zip_code)
+    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(build_addresses, axis=1)
     
     invalid_statuses = [
         'Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility',
@@ -210,8 +316,20 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         valid_gdf['Latitude'] = valid_gdf.geometry.y
         valid_gdf['Longitude'] = valid_gdf.geometry.x
 
-        valid_gdf['HouseNum_Sort'] = pd.to_numeric(valid_gdf['HouseNo'], errors='coerce').fillna(0)
-        address_list_df = valid_gdf.sort_values(by=['Territory_Name', 'Street', 'HouseNum_Sort', 'Unit'])
+        valid_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = valid_gdf["HouseNo"].apply(house_number_sort_parts)
+        valid_gdf["Unit_Sort"] = valid_gdf["Unit"].map(clean_field).str.upper()
+
+        address_list_df = valid_gdf.sort_values(
+            by=[
+                "Territory_Name",
+                "Street",
+                "HouseNum_Sort",
+                "HouseNum_Suffix_Rank",
+                "HouseNum_Text_Sort",
+                "Unit_Sort",
+            ],
+            kind="stable",
+        )
         
         export_df = address_list_df[['Territory_Name', 'Mailable_Address', 'HouseNo', 'HouseSx', 'Street', 'Unit', 'Muni', 'Zip_Code', 'Latitude', 'Longitude']].rename(columns={
             'Territory_Name': 'Territory Name', 
@@ -228,8 +346,28 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws3.column_dimensions['B'].width = 55
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
-        apt_groups = valid_gdf.groupby(['Territory_Name', 'Base_Address'], observed=True).size().reset_index(name='Total Units')
-        apt_groups = apt_groups[apt_groups['Total Units'] >= 5]
+        apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Unit"]].copy()
+        apartment_source["_Unit_Normalized"] = (
+            apartment_source["Unit"]
+            .map(clean_field)
+            .str.upper()
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+        apartment_source = apartment_source[
+            apartment_source["_Unit_Normalized"].ne("")
+            & apartment_source["Base_Address"].map(clean_field).ne("")
+        ].copy()
+
+        apt_groups = (
+            apartment_source.groupby(
+                ["Territory_Name", "Base_Address"],
+                observed=True,
+            )["_Unit_Normalized"]
+            .nunique()
+            .reset_index(name="Total Units")
+        )
+        apt_groups = apt_groups[apt_groups["Total Units"] >= 5].copy()
         
         if not counts_df.empty:
             cat_mapping = counts_df.set_index('Territory_Name')['Category'].to_dict()
@@ -356,8 +494,20 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
         # --- TAB 6: EXCLUDED AUDIT ---
         if not excluded_gdf.empty:
-            excluded_gdf['HouseNum_Sort'] = pd.to_numeric(excluded_gdf['HouseNo'], errors='coerce').fillna(0)
-            excluded_list_df = excluded_gdf.sort_values(by=['Territory_Name', 'Street', 'HouseNum_Sort', 'Unit'])
+            excluded_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = excluded_gdf["HouseNo"].apply(house_number_sort_parts)
+            excluded_gdf["Unit_Sort"] = excluded_gdf["Unit"].map(clean_field).str.upper()
+            
+            excluded_list_df = excluded_gdf.sort_values(
+                by=[
+                    "Territory_Name",
+                    "Street",
+                    "HouseNum_Sort",
+                    "HouseNum_Suffix_Rank",
+                    "HouseNum_Text_Sort",
+                    "Unit_Sort",
+                ],
+                kind="stable",
+            )
             
             export_ex_df = excluded_list_df[['Territory_Name', 'Mailable_Address', 'Addr_Statu', 'HouseNo', 'Street', 'Unit', 'Zip_Code']].rename(columns={
                 'Territory_Name': 'Territory Name', 
@@ -416,7 +566,6 @@ if uploaded_kml:
                 try:
                     kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
 
-                    # KML coordinates are WGS84 when the driver does not populate CRS metadata.
                     if kml_gdf.crs is None:
                         kml_gdf = kml_gdf.set_crs("EPSG:4326", allow_override=True)
 
@@ -450,7 +599,6 @@ if uploaded_kml:
                     else:
                         kml_gdf["Territory_Name"] = fallback_names
 
-                    # Compare normalized CRS objects and reproject parcels into the KML CRS.
                     if parcel_gdf.crs != kml_gdf.crs:
                         parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
 
@@ -462,21 +610,17 @@ if uploaded_kml:
                         & ~parcel_gdf.geometry.is_empty
                     ].copy()
 
-                    # Bounding-box prefilter only. Do not clip parcel geometry, because clipping can
-                    # alter parcels crossing the territory envelope and move representative points.
                     territory_envelope = kml_gdf.geometry.union_all().envelope
                     parcel_gdf = parcel_gdf[
                         parcel_gdf.geometry.intersects(territory_envelope)
                     ].copy()
 
-                    # Preserve the original parcel geometry while using an interior point for the join.
                     parcel_gdf["_join_point"] = parcel_gdf.geometry.representative_point()
                     parcel_join_gdf = parcel_gdf.set_geometry("_join_point")
 
                     kml_gdf = kml_gdf.rename(columns={"geometry": "geometry_terr"})
                     kml_gdf = kml_gdf.set_geometry("geometry_terr")
 
-                    # covered_by includes points located exactly on a territory boundary.
                     joined_gdf = gpd.sjoin(
                         parcel_join_gdf,
                         kml_gdf[["Territory_Name", "geometry_terr"]],
@@ -486,7 +630,6 @@ if uploaded_kml:
 
                     joined_gdf = joined_gdf.dropna(subset=["Territory_Name"])
 
-                    # Restore the full parcel geometry for all downstream processing.
                     joined_gdf = joined_gdf.set_geometry("geometry")
                     joined_gdf = joined_gdf.drop(columns=["_join_point"], errors="ignore")
                     
