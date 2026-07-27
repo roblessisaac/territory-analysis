@@ -158,6 +158,29 @@ def build_addresses(row):
 
     return pd.Series([base_addr, mailable_addr], index=["Base_Address", "Mailable_Address"])
 
+def evaluate_data_quality(row):
+    issues = []
+    house = normalize_house_number(row.get("HouseNo"))
+    street = clean_field(row.get("Street"))
+    municipality = clean_field(row.get("Muni"))
+    zip_code = normalize_zip_code(row.get("Zip_Code"))
+    base_address = clean_field(row.get("Base_Address"))
+    mailable_address = clean_field(row.get("Mailable_Address"))
+
+    if not street: issues.append("Missing Street")
+    if not municipality: issues.append("Missing Municipality")
+    if not zip_code: issues.append("Missing ZIP")
+    if house and re.fullmatch(r"[+-]?0+(?:\.0+)?", house): issues.append("Zero House Number")
+
+    zip_is_valid = not zip_code or bool(re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code))
+    address_is_malformed = (
+        not house or not base_address or not mailable_address
+        or ",," in base_address or ",," in mailable_address or not zip_is_valid
+    )
+
+    if address_is_malformed: issues.append("Malformed Address")
+    return " | ".join(issues)
+
 # --- 3. EXCEL GENERATION ENGINE ---
 def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
     output = io.BytesIO()
@@ -165,6 +188,9 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
     joined_gdf["Zip_Code"] = joined_gdf["Zip_Code"].map(normalize_zip_code)
     joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(build_addresses, axis=1)
+    joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(evaluate_data_quality, axis=1)
+    
+    flagged_record_count = joined_gdf["Data_Quality_Flag"].ne("").sum()
     
     invalid_statuses = [
         'Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility',
@@ -316,7 +342,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             ("Goal Range Setting", f"{min_goal}-{max_goal} addresses"),
             ("Total Records Loaded", len(joined_gdf)),
             ("Valid Addresses Assigned", len(valid_gdf)),
-            ("Excluded Address Count", len(excluded_gdf))
+            ("Excluded Address Count", len(excluded_gdf)),
+            ("Records Flagged with Warnings", flagged_record_count)
         ]
         
         for i, (label, val) in enumerate(tech_info, start=1):
@@ -361,22 +388,24 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
         address_list_df = valid_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
         
-        export_df = address_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'HouseNo', 'HouseSx', 'Street', 'Unit', 'Muni', 'Zip_Code', 'Latitude', 'Longitude']].rename(columns={
+        export_df = address_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'Data_Quality_Flag', 'HouseNo', 'HouseSx', 'Street', 'Unit', 'Muni', 'Zip_Code', 'Latitude', 'Longitude']].rename(columns={
             'Territory_Name': 'Territory Name', 
-            'Mailable_Address': 'Mailable Address'
+            'Mailable_Address': 'Mailable Address',
+            'Data_Quality_Flag': 'Data Quality Flag'
         })
         export_df.to_excel(writer, sheet_name="Address List", index=False)
         
         ws3 = writer.sheets['Address List']
         add_excel_table(ws3, export_df, "AddressListTable")
         
-        for col_letter in ['E', 'F', 'G', 'H', 'I', 'J', 'K', 'L']:
+        for col_letter in ['F', 'G', 'H', 'I', 'J', 'K', 'L', 'M']:
             ws3.column_dimensions[col_letter].hidden = True
             
         ws3.column_dimensions['A'].width = 18
         ws3.column_dimensions['B'].width = 15
         ws3.column_dimensions['C'].width = 15
         ws3.column_dimensions['D'].width = 55
+        ws3.column_dimensions['E'].width = 35
 
         # --- TAB 4: APARTMENTS / POTENTIAL LETTER WRITING ---
         apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Unit"]].copy()
@@ -462,23 +491,26 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             excluded_gdf["Unit_Sort"] = excluded_gdf["Unit"].map(clean_field).str.upper()
             excluded_list_df = excluded_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
             
-            export_ex_df = excluded_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'Addr_Statu', 'HouseNo', 'Street', 'Unit', 'Zip_Code']].rename(columns={
+            export_ex_df = excluded_list_df[['Territory_Name', 'NWS_Category', 'NWS_Number', 'Mailable_Address', 'Addr_Statu', 'Data_Quality_Flag', 'HouseNo', 'Street', 'Unit', 'Zip_Code']].rename(columns={
                 'Territory_Name': 'Territory Name', 
-                'Mailable_Address': 'Mailable Address'
+                'Mailable_Address': 'Mailable Address',
+                'Addr_Statu': 'Exclusion Reason',
+                'Data_Quality_Flag': 'Data Quality Flag'
             })
             export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
             
             ws6 = writer.sheets['Excluded Audit']
             add_excel_table(ws6, export_ex_df, "ExcludedAuditTable")
             
-            for col_letter in ['F', 'G', 'H', 'I']:
+            for col_letter in ['G', 'H', 'I', 'J']:
                 ws6.column_dimensions[col_letter].hidden = True
                 
             ws6.column_dimensions['A'].width = 18
             ws6.column_dimensions['B'].width = 15
             ws6.column_dimensions['C'].width = 15
             ws6.column_dimensions['D'].width = 55
-            ws6.column_dimensions['E'].width = 28
+            ws6.column_dimensions['E'].width = 25
+            ws6.column_dimensions['F'].width = 35
         else:
             pd.DataFrame(columns=["Notice"]).to_excel(writer, sheet_name="Excluded Audit", index=False)
             writer.sheets['Excluded Audit'].cell(row=2, column=1, value="No addresses were excluded in this map area.")
