@@ -12,6 +12,50 @@ import datetime
 import re
 from fractions import Fraction
 
+COUNTY_CONFIGS = {
+    "Milwaukee": {
+        "file_path": "zip://data/Milwaukee_Datapoints07072026.zip",
+        "state": "WI",
+        "metric_crs": "EPSG:3071",
+        "native_source_id": "TAXKEY",
+        "excluded_statuses": [
+            "Undeveloped",
+            "Parking Lot",
+            "ROW",
+            "Park or Recreational Facility",
+            "Undeveloped Outlot",
+            "Sliver or Remnant",
+            "Non Addressable Assoc with Adj Parcel",
+        ],
+        "column_mapping": {
+            "TAXKEY": "Canonical_Native_Source_ID",
+            "HouseNo": "Canonical_HouseNo",
+            "HouseSx": "Canonical_HouseSx",
+            "Dir": "Canonical_Dir",
+            "Street": "Canonical_Street",
+            "StType": "Canonical_StType",
+            "Muni": "Canonical_Muni",
+            "Zip_Code": "Canonical_Zip_Code",
+            "Unit": "Canonical_Unit",
+            "Addr_Statu": "Canonical_Status",
+        },
+    }
+}
+
+REQUIRED_CANONICAL_COLUMNS = [
+    "Canonical_Native_Source_ID",
+    "Canonical_HouseNo",
+    "Canonical_HouseSx",
+    "Canonical_Dir",
+    "Canonical_Street",
+    "Canonical_StType",
+    "Canonical_Muni",
+    "Canonical_Zip_Code",
+    "Canonical_Unit",
+    "Canonical_Status",
+    "geometry",
+]
+
 # Enable KML support in GeoPandas
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
@@ -24,7 +68,10 @@ st.markdown("Upload your territories KML map to generate a complete, filtered ad
 
 st.sidebar.header("Step 1: Configuration")
 congregation_name = st.sidebar.text_input("Congregation Name (No Spaces)", "ExampleCongregation")
-selected_county = st.sidebar.selectbox("Select County Data", ["Milwaukee"]) 
+selected_county = st.sidebar.selectbox(
+    "Select County Data",
+    list(COUNTY_CONFIGS.keys()),
+)
 goal_range = st.sidebar.selectbox("Goal # of Addresses Per Territory", 
                                   ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"])
 
@@ -36,14 +83,17 @@ MIN_GOAL, MAX_GOAL = [int(x) for x in goal_range.split("-")]
 # --- 2. DATA LOADING & CACHING ---
 @st.cache_data
 def load_county_data(county_name):
-    if county_name == "Milwaukee":
-        file_path = "zip://data/Milwaukee_Datapoints07072026.zip"
-        try:
-            return gpd.read_file(file_path)
-        except Exception as e:
-            st.error(f"Error loading county shapefile. Check that the zip is in the /data/ folder. Error: {e}")
-            return None
-    return None
+    county_config = COUNTY_CONFIGS[county_name]
+    file_path = county_config["file_path"]
+
+    try:
+        return gpd.read_file(file_path)
+    except Exception as error:
+        st.error(
+            "Error loading county shapefile. Check the configured file path. "
+            f"Error: {error}"
+        )
+        return None
 
 def natural_keys(text):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text))]
@@ -105,20 +155,20 @@ def house_number_sort_parts(value):
         return pd.Series([float(number), 0 if not suffix.strip() else 2, suffix.strip()])
     return pd.Series([float("inf"), 8, compact])
 
-def build_addresses(row):
-    house = normalize_house_number(row.get("HouseNo"))
-    house_sx = clean_field(row.get("HouseSx"))
-    direction = clean_field(row.get("Dir"))
-    street = clean_field(row.get("Street"))
-    st_type = clean_field(row.get("StType"))
-    muni = clean_field(row.get("Muni"))
-    zip_c = normalize_zip_code(row.get("Zip_Code"))
-    unit_str = normalize_unit(row.get("Unit"))
+def build_addresses(row, state):
+    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    house_sx = clean_field(row.get("Canonical_HouseSx"))
+    direction = clean_field(row.get("Canonical_Dir"))
+    street = clean_field(row.get("Canonical_Street"))
+    st_type = clean_field(row.get("Canonical_StType"))
+    muni = clean_field(row.get("Canonical_Muni"))
+    zip_c = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    unit_str = normalize_unit(row.get("Canonical_Unit"))
 
     full_house_num = f"{house}{house_sx}".strip()
     full_street = " ".join(part for part in [direction, street, st_type] if part)
     base_addr_line = " ".join(part for part in [full_house_num, full_street] if part)
-    locality = ", ".join(part for part in [muni, "WI"] if part)
+    locality = ", ".join(part for part in [muni, state] if part)
     if zip_c: locality = f"{locality} {zip_c}".strip()
 
     base_addr = ", ".join(part for part in [base_addr_line, locality] if part)
@@ -128,10 +178,10 @@ def build_addresses(row):
 
 def evaluate_data_quality(row):
     issues = []
-    house = normalize_house_number(row.get("HouseNo"))
-    street = clean_field(row.get("Street"))
-    municipality = clean_field(row.get("Muni"))
-    zip_code = normalize_zip_code(row.get("Zip_Code"))
+    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    street = clean_field(row.get("Canonical_Street"))
+    municipality = clean_field(row.get("Canonical_Muni"))
+    zip_code = normalize_zip_code(row.get("Canonical_Zip_Code"))
     base_address = clean_field(row.get("Base_Address"))
     mailable_address = clean_field(row.get("Mailable_Address"))
 
@@ -146,19 +196,40 @@ def evaluate_data_quality(row):
     return " | ".join(issues)
 
 # --- 3. EXCEL GENERATION ENGINE ---
-def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
+def generate_excel_report(
+    joined_gdf,
+    kml_gdf,
+    min_goal,
+    max_goal,
+    cong_name,
+    county_config,
+):
     output = io.BytesIO()
     run_timestamp = datetime.datetime.now()
+    state = county_config["state"]
+    metric_crs = county_config["metric_crs"]
+    excluded_statuses = county_config["excluded_statuses"]
 
     joined_gdf = joined_gdf.copy()
-    joined_gdf["Zip_Code"] = joined_gdf["Zip_Code"].map(normalize_zip_code)
-    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(build_addresses, axis=1)
+    joined_gdf["Canonical_Zip_Code"] = joined_gdf["Canonical_Zip_Code"].map(normalize_zip_code)
+    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(
+        lambda row: build_addresses(row, state),
+        axis=1,
+    )
     joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(evaluate_data_quality, axis=1)
     flagged_record_count = joined_gdf["Data_Quality_Flag"].ne("").sum()
 
-    invalid_statuses = ['Undeveloped', 'Parking Lot', 'ROW', 'Park or Recreational Facility', 'Undeveloped Outlot', 'Sliver or Remnant', 'Non Addressable Assoc with Adj Parcel']
-    excluded_gdf = joined_gdf[joined_gdf["Addr_Statu"].isin(invalid_statuses)].copy()
-    valid_gdf = joined_gdf[~joined_gdf["Addr_Statu"].isin(invalid_statuses)].copy()
+    normalized_excluded_statuses = {
+        clean_field(status).upper() for status in excluded_statuses
+    }
+    joined_gdf["Canonical_Status_Normalized"] = (
+        joined_gdf["Canonical_Status"].map(clean_field).str.upper()
+    )
+    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(
+        normalized_excluded_statuses
+    )
+    excluded_gdf = joined_gdf[exclusion_mask].copy()
+    valid_gdf = joined_gdf[~exclusion_mask].copy()
 
     unique_territories = valid_gdf["Territory_Name"].unique().tolist()
     unique_territories.sort(key=natural_keys)
@@ -339,15 +410,26 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         # --- TAB 3: ADDRESS LIST ---
         valid_gdf["Latitude"] = valid_gdf.geometry.y
         valid_gdf["Longitude"] = valid_gdf.geometry.x
-        valid_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = valid_gdf["HouseNo"].apply(house_number_sort_parts)
-        valid_gdf["Unit_Sort"] = valid_gdf["Unit"].map(clean_field).str.upper()
+        valid_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = valid_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
+        valid_gdf["Unit_Sort"] = valid_gdf["Canonical_Unit"].map(clean_field).str.upper()
 
-        address_list_df = valid_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
+        address_list_df = valid_gdf.sort_values(by=["Territory_Name", "Canonical_Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
         
         export_df = address_list_df[[
             "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Data_Quality_Flag",
-            "HouseNo", "HouseSx", "Street", "Unit", "Muni", "Zip_Code", "Latitude", "Longitude"
-        ]].rename(columns={"Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", "Data_Quality_Flag": "Data Quality Flag"})
+            "Canonical_HouseNo", "Canonical_HouseSx", "Canonical_Street", "Canonical_Unit", "Canonical_Muni", "Canonical_Zip_Code", "Latitude", "Longitude"
+        ]].rename(columns={
+            "Source_Record_ID": "Source Record ID",
+            "Territory_Name": "Territory Name",
+            "Mailable_Address": "Mailable Address",
+            "Data_Quality_Flag": "Data Quality Flag",
+            "Canonical_HouseNo": "HouseNo",
+            "Canonical_HouseSx": "HouseSx",
+            "Canonical_Street": "Street",
+            "Canonical_Unit": "Unit",
+            "Canonical_Muni": "Muni",
+            "Canonical_Zip_Code": "Zip_Code",
+        })
 
         export_df.to_excel(writer, sheet_name="Address List", index=False)
         ws3 = writer.sheets["Address List"]
@@ -362,8 +444,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         ws3.column_dimensions["F"].width = 35
 
         # --- TAB 4: APARTMENTS ---
-        apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Unit"]].copy()
-        apartment_source["_Unit_Normalized"] = apartment_source["Unit"].map(clean_field).str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
+        apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Canonical_Unit"]].copy()
+        apartment_source["_Unit_Normalized"] = apartment_source["Canonical_Unit"].map(clean_field).str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
         apartment_source = apartment_source[apartment_source["_Unit_Normalized"].ne("") & apartment_source["Base_Address"].map(clean_field).ne("")].copy()
 
         apt_groups = apartment_source.groupby(["Territory_Name", "Base_Address"], observed=True)["_Unit_Normalized"].nunique().reset_index(name="Total Units")
@@ -399,7 +481,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
         terr_geoms["geometry_terr"] = terr_geoms.geometry.make_valid()
         terr_geoms = terr_geoms[terr_geoms.geometry.notna() & ~terr_geoms.geometry.is_empty].copy()
         
-        terr_geoms_metric = terr_geoms.to_crs("EPSG:3857")
+        terr_geoms_metric = terr_geoms.to_crs(metric_crs)
         territory_sindex = terr_geoms_metric.sindex
 
         count_lookup = counts_df.drop_duplicates("Territory_Name").set_index("Territory_Name")["Total_Addresses"].to_dict()
@@ -447,16 +529,23 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
 
         # --- TAB 6: EXCLUDED AUDIT ---
         if not excluded_gdf.empty:
-            excluded_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = excluded_gdf["HouseNo"].apply(house_number_sort_parts)
-            excluded_gdf["Unit_Sort"] = excluded_gdf["Unit"].map(clean_field).str.upper()
-            excluded_list_df = excluded_gdf.sort_values(by=["Territory_Name", "Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
+            excluded_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = excluded_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
+            excluded_gdf["Unit_Sort"] = excluded_gdf["Canonical_Unit"].map(clean_field).str.upper()
+            excluded_list_df = excluded_gdf.sort_values(by=["Territory_Name", "Canonical_Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
             
             export_ex_df = excluded_list_df[[
-                "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Addr_Statu", "Data_Quality_Flag",
-                "HouseNo", "Street", "Unit", "Zip_Code"
+                "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Canonical_Status", "Data_Quality_Flag",
+                "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"
             ]].rename(columns={
-                "Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", 
-                "Addr_Statu": "Exclusion Reason", "Data_Quality_Flag": "Data Quality Flag"
+                "Source_Record_ID": "Source Record ID",
+                "Territory_Name": "Territory Name",
+                "Mailable_Address": "Mailable Address",
+                "Canonical_Status": "Exclusion Reason",
+                "Data_Quality_Flag": "Data Quality Flag",
+                "Canonical_HouseNo": "HouseNo",
+                "Canonical_Street": "Street",
+                "Canonical_Unit": "Unit",
+                "Canonical_Zip_Code": "Zip_Code",
             })
             export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
             ws6 = writer.sheets["Excluded Audit"]
@@ -471,7 +560,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name):
             ws6.column_dimensions["F"].width = 25
             ws6.column_dimensions["G"].width = 35
         else:
-            empty_excluded_columns = ["Source Record ID", "Territory Name", "NWS_Category", "NWS_Number", "Mailable Address", "Exclusion Reason", "Data Quality Flag", "HouseNo", "Street", "Unit", "Zip_Code"]
+            empty_excluded_columns = ["Source Record ID", "Territory Name", "NWS_Category", "NWS_Number", "Mailable Address", "Exclusion Reason", "Data Quality Flag", "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"]
             pd.DataFrame(columns=empty_excluded_columns).to_excel(writer, sheet_name="Excluded Audit", index=False)
             writer.sheets["Excluded Audit"].cell(row=2, column=1, value="No addresses were excluded in this map area.")
 
@@ -505,9 +594,58 @@ if uploaded_kml:
             parcel_gdf = load_county_data(selected_county)
 
         if parcel_gdf is not None:
+            county_config = COUNTY_CONFIGS[selected_county]
             parcel_gdf = parcel_gdf.reset_index(drop=True).copy()
-            county_id_prefix = re.sub(r"[^A-Za-z0-9]+", "_", selected_county.upper()).strip("_")
-            parcel_gdf["Source_Record_ID"] = [f"{county_id_prefix}-{row_number:09d}" for row_number in range(1, len(parcel_gdf) + 1)]
+            parcel_gdf = parcel_gdf.rename(
+                columns=county_config["column_mapping"]
+            )
+
+            missing_columns = [
+                column
+                for column in REQUIRED_CANONICAL_COLUMNS
+                if column not in parcel_gdf.columns
+            ]
+            if missing_columns:
+                st.error(
+                    "County data failed preflight validation. Missing required "
+                    "canonical columns: " + ", ".join(missing_columns)
+                )
+                st.stop()
+
+            native_id_column = county_config["column_mapping"][
+                county_config["native_source_id"]
+            ]
+            county_id_prefix = re.sub(
+                r"[^A-Za-z0-9]+",
+                "_",
+                selected_county.upper(),
+            ).strip("_")
+            fallback_ids = pd.Series(
+                [
+                    f"{county_id_prefix}-FALLBACK-{row_number:09d}"
+                    for row_number in range(1, len(parcel_gdf) + 1)
+                ],
+                index=parcel_gdf.index,
+                dtype="string",
+            )
+            native_ids = parcel_gdf[native_id_column].map(clean_field)
+            parcel_gdf["Source_Record_ID"] = native_ids.where(
+                native_ids.ne(""),
+                fallback_ids,
+            )
+
+            duplicate_native_ids = parcel_gdf[
+                "Source_Record_ID"
+            ].duplicated(keep=False)
+            if duplicate_native_ids.any():
+                duplicate_sequence = (
+                    parcel_gdf.groupby("Source_Record_ID").cumcount() + 1
+                ).astype(str)
+                parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] = (
+                    parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"]
+                    + "-DUP-"
+                    + duplicate_sequence.loc[duplicate_native_ids]
+                )
 
             with st.spinner("Parsing KML Territories & Executing Spatial Join..."):
                 try:
@@ -554,7 +692,14 @@ if uploaded_kml:
                         st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
 
                     with st.spinner("Generating Excel Report..."):
-                        excel_file = generate_excel_report(joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""))
+                        excel_file = generate_excel_report(
+                            joined_gdf,
+                            kml_gdf,
+                            MIN_GOAL,
+                            MAX_GOAL,
+                            congregation_name.replace(" ", ""),
+                            county_config,
+                        )
                         filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
                         st.session_state["excel_data"] = excel_file.getvalue()
                         st.session_state["excel_filename"] = filename
