@@ -387,12 +387,73 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         excluded_gdf["NWS_Category"] = excluded_gdf["NWS_Category"].fillna("UNK")
         excluded_gdf["NWS_Number"] = excluded_gdf["NWS_Number"].fillna("0")
 
-    apartment_source = valid_gdf[["Territory_Name", "Base_Address", "Canonical_Unit"]].copy()
-    apartment_source["_Unit_Normalized"] = apartment_source["Canonical_Unit"].map(clean_field).str.upper().str.replace(r"\s+", " ", regex=True).str.strip()
-    apartment_source = apartment_source[apartment_source["_Unit_Normalized"].ne("") & apartment_source["Base_Address"].map(clean_field).ne("")].copy()
+    apartment_source = valid_gdf[
+        ["Territory_Name", "Base_Address", "Canonical_Unit"]
+    ].copy()
+    apartment_source["_Unit_Normalized"] = (
+        apartment_source["Canonical_Unit"]
+        .map(clean_field)
+        .str.upper()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+    )
+    apartment_source = apartment_source[
+        apartment_source["Base_Address"].map(clean_field).ne("")
+    ].copy()
+    apartment_source["_Has_Nonblank_Unit"] = apartment_source[
+        "_Unit_Normalized"
+    ].ne("")
 
-    apt_groups = apartment_source.groupby(["Territory_Name", "Base_Address"], observed=True)["_Unit_Normalized"].nunique().reset_index(name="Total Units")
-    apt_groups = apt_groups[apt_groups["Total Units"] >= apt_threshold].copy()
+    apt_groups = (
+        apartment_source.groupby(
+            ["Territory_Name", "Base_Address"],
+            observed=True,
+        )
+        .agg(
+            **{
+                "Source Rows": ("_Unit_Normalized", "size"),
+                "Nonblank Unit Rows": ("_Has_Nonblank_Unit", "sum"),
+                "Unique Normalized Units": (
+                    "_Unit_Normalized",
+                    lambda values: values[values.ne("")].nunique(),
+                ),
+            }
+        )
+        .reset_index()
+    )
+    apt_groups["Blank Parent Rows"] = (
+        apt_groups["Source Rows"] - apt_groups["Nonblank Unit Rows"]
+    )
+    apt_groups["Duplicate Units"] = (
+        apt_groups["Nonblank Unit Rows"]
+        - apt_groups["Unique Normalized Units"]
+    ).clip(lower=0)
+    apt_groups["Reported County Unit Count"] = ""
+    apt_groups["Total Units"] = apt_groups["Unique Normalized Units"]
+
+    def get_apartment_confidence(row):
+        if row["Unique Normalized Units"] < apt_threshold:
+            return "Below Threshold"
+        if row["Duplicate Units"] == 0 and row["Blank Parent Rows"] <= 1:
+            return "High"
+        if row["Duplicate Units"] <= 2:
+            return "Medium"
+        return "Low"
+
+    apt_groups["Apartment Confidence"] = apt_groups.apply(
+        get_apartment_confidence,
+        axis=1,
+    )
+    apt_groups["Detection Reason"] = apt_groups.apply(
+        lambda row: (
+            f"{int(row['Unique Normalized Units'])} unique nonblank unit "
+            f"identifier(s) met the threshold of {apt_threshold}."
+        ),
+        axis=1,
+    )
+    apt_groups = apt_groups[
+        apt_groups["Total Units"] >= apt_threshold
+    ].copy()
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         
@@ -645,7 +706,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             "D": 22,
             "E": 28,
             "F": 22,
-            "G": 62,
+            "G": 92,
         }
         for column_letter, width in counts_widths.items():
             ws2.column_dimensions[column_letter].width = width
@@ -719,6 +780,28 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 status_cell=True,
             )
 
+            suggested_action = ws2.cell(
+                row=row_number,
+                column=7,
+            ).value
+            if (
+                current_status == "Ideal"
+                and potential_status == "Ideal"
+                and suggested_action == "No action needed"
+            ):
+                no_action_fill = PatternFill(
+                    start_color="C4EFD0",
+                    end_color="C4EFD0",
+                    fill_type="solid",
+                )
+                for column_number in range(1, 8):
+                    cell = ws2.cell(
+                        row=row_number,
+                        column=column_number,
+                    )
+                    cell.font = Font(bold=True, color="000000")
+                    cell.fill = no_action_fill
+
         # --- TAB 3: ADDRESS LIST ---
         valid_gdf["Latitude"] = valid_gdf.geometry.y
         valid_gdf["Longitude"] = valid_gdf.geometry.x
@@ -791,12 +874,15 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             index=False,
         )
         ws3 = writer.sheets["Address List"]
-        add_excel_table(
-            ws3,
-            export_df,
-            "AddressListTable",
-            show_stripes=False,
+
+        address_table = Table(
+            displayName="AddressListTable",
+            ref=(
+                f"A1:{openpyxl.utils.get_column_letter(len(export_df.columns))}"
+                f"{len(export_df) + 1}"
+            ),
         )
+        ws3.add_table(address_table)
 
         hidden_address_columns = [
             "C",
@@ -821,25 +907,71 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         ws3.column_dimensions["A"].width = 20
         ws3.column_dimensions["B"].width = 55
+        ws3.column_dimensions["R"].width = 22
         ws3.column_dimensions["S"].width = 38
 
-        for cell in ws3[1]:
-            cell.font = Font(bold=True, color="000000")
-            cell.fill = PatternFill(fill_type=None)
-            cell.alignment = Alignment(
-                horizontal="center",
-                vertical="center",
-                wrap_text=True,
-            )
-
+        stripe_fill = PatternFill(
+            start_color="F3F3F3",
+            end_color="F3F3F3",
+            fill_type="solid",
+        )
+        white_fill = PatternFill(
+            start_color="FFFFFF",
+            end_color="FFFFFF",
+            fill_type="solid",
+        )
         quality_warning_fill = PatternFill(
             start_color="EA9F9D",
             end_color="EA9F9D",
             fill_type="solid",
         )
-        quality_flag_column = export_df.columns.get_loc("Data Quality Flag") + 1
+
+        for row_number in range(1, len(export_df) + 2):
+            row_fill = stripe_fill if row_number % 2 == 1 else white_fill
+            for column_number in range(1, len(export_df.columns) + 1):
+                cell = ws3.cell(
+                    row=row_number,
+                    column=column_number,
+                )
+                cell.fill = row_fill
+                if row_number == 1:
+                    cell.font = Font(bold=True, color="000000")
+                    cell.alignment = Alignment(
+                        horizontal="center",
+                        vertical="center",
+                        wrap_text=True,
+                    )
+
+        source_record_column = (
+            export_df.columns.get_loc("Source record ID") + 1
+        )
+        latitude_column = export_df.columns.get_loc("Latitude") + 1
+        longitude_column = export_df.columns.get_loc("Longitude") + 1
+        quality_flag_column = (
+            export_df.columns.get_loc("Data Quality Flag") + 1
+        )
 
         for row_number in range(2, len(export_df) + 2):
+            source_id_cell = ws3.cell(
+                row=row_number,
+                column=source_record_column,
+            )
+            source_id_cell.alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=False,
+                shrink_to_fit=False,
+            )
+
+            for coordinate_column in [latitude_column, longitude_column]:
+                coordinate_cell = ws3.cell(
+                    row=row_number,
+                    column=coordinate_column,
+                )
+                if coordinate_cell.value not in {None, ""}:
+                    coordinate_cell.value = float(coordinate_cell.value)
+                    coordinate_cell.number_format = "0.################"
+
             quality_flag = ws3.cell(
                 row=row_number,
                 column=quality_flag_column,
@@ -853,26 +985,170 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         # --- TAB 4: APARTMENTS ---
         if not counts_df.empty:
-            category_mapping = counts_df.set_index("Territory_Name")["Category"].to_dict()
-            apt_groups["Status"] = apt_groups["Territory_Name"].map(category_mapping)
-        else: apt_groups["Status"] = "Unknown"
+            category_mapping = counts_df.set_index("Territory_Name")[
+                "Category"
+            ].to_dict()
+            address_count_mapping = counts_df.set_index("Territory_Name")[
+                "Total_Addresses"
+            ].to_dict()
+            apt_groups["Current Territory Status"] = apt_groups[
+                "Territory_Name"
+            ].map(category_mapping)
+            apt_groups["Total Addresses in Territory"] = apt_groups[
+                "Territory_Name"
+            ].map(address_count_mapping).fillna(0).astype(int)
+        else:
+            apt_groups["Current Territory Status"] = "Unknown"
+            apt_groups["Total Addresses in Territory"] = 0
 
-        def format_terr_name(row): return f"{row['Territory_Name']} [{row['Status']}]"
+        apt_groups["_Potential Address Count"] = (
+            apt_groups["Total Addresses in Territory"]
+            - apt_groups["Total Units"]
+        ).clip(lower=0)
+        apt_groups["_Potential Status"] = apt_groups[
+            "_Potential Address Count"
+        ].apply(get_category)
+
+        def get_apartment_suggested_action(row):
+            current_status = row["Current Territory Status"]
+            potential_status = row["_Potential Status"]
+
+            if current_status == "Undersized":
+                return (
+                    "Retain as door-to-door. Territory is already undersized. "
+                    "If there are border refinements, reconsider"
+                )
+            if potential_status == "Undersized":
+                return (
+                    "If accessible from street level, this building should "
+                    "stay door-to-door. If there are border refinements, "
+                    "reconsider"
+                )
+            if current_status == "Oversized" and potential_status == "Ideal":
+                return (
+                    "Ideal candidate for letter writing. Removing this building "
+                    "brings the territory into the target range."
+                )
+            if (
+                current_status == "Oversized"
+                and potential_status == "Oversized"
+            ):
+                return (
+                    "Consider for letter writing. Further border adjustments or "
+                    "building removals will still be needed."
+                )
+            if current_status == "Ideal" and potential_status == "Ideal":
+                return (
+                    "Optional for letter writing. The territory remains in the "
+                    "target range either way."
+                )
+            return "Review building manually"
+
+        apt_groups["Suggested Action"] = apt_groups.apply(
+            get_apartment_suggested_action,
+            axis=1,
+        )
 
         if not apt_groups.empty:
-            apt_groups["Territory Name"] = apt_groups.apply(format_terr_name, axis=1)
-            apt_groups.rename(columns={"Base_Address": "Base Address"}, inplace=True)
-            apt_export = apt_groups[["Territory Name", "Base Address", "Total Units"]]
+            apt_export = apt_groups.rename(
+                columns={
+                    "Territory_Name": "Territory Name",
+                    "Base_Address": "Base Address",
+                }
+            )[
+                [
+                    "Territory Name",
+                    "Base Address",
+                    "Total Units",
+                    "Current Territory Status",
+                    "Total Addresses in Territory",
+                    "Suggested Action",
+                    "Source Rows",
+                    "Nonblank Unit Rows",
+                    "Unique Normalized Units",
+                    "Blank Parent Rows",
+                    "Duplicate Units",
+                    "Reported County Unit Count",
+                    "Apartment Confidence",
+                    "Detection Reason",
+                ]
+            ]
         else:
-            apt_export = pd.DataFrame(columns=["Territory Name", "Base Address", "Total Units"])
+            apt_export = pd.DataFrame(
+                columns=[
+                    "Territory Name",
+                    "Base Address",
+                    "Total Units",
+                    "Current Territory Status",
+                    "Total Addresses in Territory",
+                    "Suggested Action",
+                    "Source Rows",
+                    "Nonblank Unit Rows",
+                    "Unique Normalized Units",
+                    "Blank Parent Rows",
+                    "Duplicate Units",
+                    "Reported County Unit Count",
+                    "Apartment Confidence",
+                    "Detection Reason",
+                ]
+            )
 
-        apt_export.to_excel(writer, sheet_name="Apartments", index=False)
+        apt_export.to_excel(
+            writer,
+            sheet_name="Apartments",
+            index=False,
+        )
         ws4 = writer.sheets["Apartments"]
-        add_excel_table(ws4, apt_export, "ApartmentsTable", show_stripes=True)
-        ws4.column_dimensions["A"].width = 30
-        ws4.column_dimensions["B"].width = 40
-        ws4.column_dimensions["C"].width = 15
-        for row_number in range(2, len(apt_export) + 2): ws4[f"C{row_number}"].alignment = Alignment(horizontal="center")
+
+        apartment_table = Table(
+            displayName="ApartmentsTable",
+            ref=(
+                f"A1:{openpyxl.utils.get_column_letter(len(apt_export.columns))}"
+                f"{len(apt_export) + 1}"
+            ),
+        )
+        ws4.add_table(apartment_table)
+
+        apartment_widths = {
+            "A": 30,
+            "B": 40,
+            "C": 15,
+            "D": 24,
+            "E": 24,
+            "F": 92,
+        }
+        for column_letter, width in apartment_widths.items():
+            ws4.column_dimensions[column_letter].width = width
+
+        for column_letter in ["G", "H", "I", "J", "K", "L", "M", "N"]:
+            ws4.column_dimensions[column_letter].hidden = True
+
+        stripe_fill = PatternFill(
+            start_color="F3F3F3",
+            end_color="F3F3F3",
+            fill_type="solid",
+        )
+        white_fill = PatternFill(
+            start_color="FFFFFF",
+            end_color="FFFFFF",
+            fill_type="solid",
+        )
+
+        for row_number in range(1, len(apt_export) + 2):
+            row_fill = stripe_fill if row_number % 2 == 1 else white_fill
+            for column_number in range(1, len(apt_export.columns) + 1):
+                cell = ws4.cell(
+                    row=row_number,
+                    column=column_number,
+                )
+                cell.fill = row_fill
+                cell.alignment = Alignment(
+                    horizontal=("left" if column_number in {1, 2, 6, 14} else "center"),
+                    vertical="center",
+                    wrap_text=column_number in {1, 2, 4, 5, 6, 13, 14},
+                )
+                if row_number == 1:
+                    cell.font = Font(bold=True, color="000000")
 
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df.loc[counts_df["Category"].eq("Oversized"), "Territory_Name"].tolist() if not counts_df.empty else []
