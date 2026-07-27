@@ -611,4 +611,43 @@ if uploaded_kml:
                     parcel_gdf = parcel_gdf[parcel_gdf.geometry.notna() & ~parcel_gdf.geometry.is_empty].copy()
 
                     territory_envelope = kml_gdf.geometry.union_all().envelope
-                    parcel_gdf = parcel_gdf[parcel_gdf.
+                    parcel_gdf = parcel_gdf[parcel_gdf.geometry.intersects(territory_envelope)].copy()
+
+                    parcel_gdf["_join_point"] = parcel_gdf.geometry.representative_point()
+                    parcel_join_gdf = parcel_gdf.set_geometry("_join_point")
+                    kml_gdf = kml_gdf.rename(columns={"geometry": "geometry_terr"}).set_geometry("geometry_terr")
+
+                    joined_gdf = gpd.sjoin(parcel_join_gdf, kml_gdf[["Territory_Name", "geometry_terr"]], how="inner", predicate="covered_by")
+                    joined_gdf = joined_gdf.dropna(subset=["Territory_Name"]).copy()
+
+                    joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
+                    joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
+                    
+                    duplicate_assignment_count = joined_gdf.duplicated(subset=["Source_Record_ID"], keep="first").sum()
+                    joined_gdf = joined_gdf.drop_duplicates(subset=["Source_Record_ID"], keep="first").copy()
+                    
+                    joined_gdf = joined_gdf.drop(columns=["_Territory_Sort"], errors="ignore")
+                    joined_gdf = joined_gdf.set_geometry("geometry")
+                    joined_gdf = joined_gdf.drop(columns=["_join_point", "index_right"], errors="ignore")
+
+                    if duplicate_assignment_count > 0:
+                        st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
+
+                    with st.spinner("Generating Excel Report..."):
+                        excel_file = generate_excel_report(joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""), county_config)
+                        filename = f"{congregation_name.replace(' ', '')}_{datetime.datetime.now().strftime('%B%Y')}_TerritoryAnalysis.xlsx"
+                        st.session_state["excel_data"] = excel_file.getvalue()
+                        st.session_state["excel_filename"] = filename
+                        st.success("Analysis Complete!")
+
+                except Exception as error:
+                    st.error(f"An error occurred during processing: {error}")
+
+    if "excel_data" in st.session_state:
+        st.info("Analysis results ready for download.")
+        st.download_button(
+            label="⬇️ Download Excel Analysis",
+            data=st.session_state["excel_data"],
+            file_name=st.session_state["excel_filename"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
