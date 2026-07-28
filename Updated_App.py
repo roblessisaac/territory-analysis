@@ -1323,59 +1323,529 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     column=column_number,
                 ).border = apartment_border
 
-        # --- TAB 5: BORDER REWRITES ---
-        oversized = counts_df.loc[counts_df["Category"].eq("Oversized"), "Territory_Name"].tolist() if not counts_df.empty else []
-        undersized = counts_df.loc[counts_df["Category"].eq("Undersized"), "Territory_Name"].tolist() if not counts_df.empty else []
+        # --- TAB 5: TERRITORY BALANCING ---
+        balancing_columns = [
+            "Oversized Territory",
+            "Balancing Method",
+            "Neighbor/Target",
+            "Priority",
+            "Est. Shift Needed",
+            "Projected Statuses",
+            "Why",
+        ]
 
-        terr_geoms = kml_gdf[["Territory_Name", "geometry_terr"]].dropna(subset=["Territory_Name", "geometry_terr"]).set_geometry("geometry_terr").dissolve(by="Territory_Name")
+        def distance_from_ideal(count, goal_minimum, goal_maximum):
+            if count < goal_minimum:
+                return goal_minimum - count
+            if count > goal_maximum:
+                return count - goal_maximum
+            return 0
+
+        def status_with_count(count, category_function):
+            integer_count = int(count)
+            return f"{integer_count} ({category_function(integer_count)})"
+
+        def materially_improved(original_distance, projected_distance):
+            if original_distance <= 0:
+                return False
+
+            improvement = original_distance - projected_distance
+            proportional_improvement = improvement / original_distance
+            return improvement >= 10 or proportional_improvement >= 0.25
+
+        def evaluate_spatial_shift(
+            oversized_count,
+            undersized_count,
+            goal_minimum,
+            goal_maximum,
+            category_function,
+        ):
+            equalizing_shift = max(
+                int((oversized_count - undersized_count) // 2),
+                0,
+            )
+
+            if equalizing_shift < 1:
+                return None
+
+            minimum_for_oversized_to_be_ideal = max(
+                oversized_count - goal_maximum,
+                0,
+            )
+            minimum_for_undersized_to_be_ideal = max(
+                goal_minimum - undersized_count,
+                0,
+            )
+            minimum_to_make_both_ideal = max(
+                minimum_for_oversized_to_be_ideal,
+                minimum_for_undersized_to_be_ideal,
+            )
+
+            maximum_that_keeps_oversized_ideal = max(
+                oversized_count - goal_minimum,
+                0,
+            )
+            maximum_that_keeps_undersized_ideal = max(
+                goal_maximum - undersized_count,
+                0,
+            )
+            maximum_for_both_ideal = min(
+                maximum_that_keeps_oversized_ideal,
+                maximum_that_keeps_undersized_ideal,
+                equalizing_shift,
+            )
+
+            if (
+                minimum_to_make_both_ideal >= 1
+                and minimum_to_make_both_ideal <= maximum_for_both_ideal
+            ):
+                shift = int(minimum_to_make_both_ideal)
+                projected_oversized = oversized_count - shift
+                projected_undersized = undersized_count + shift
+                return {
+                    "shift": shift,
+                    "priority": "High",
+                    "projected_oversized": projected_oversized,
+                    "projected_undersized": projected_undersized,
+                    "why": (
+                        f"Shifting approximately {shift} addresses brings both "
+                        "territories into the ideal range."
+                    ),
+                }
+
+            original_oversized_distance = distance_from_ideal(
+                oversized_count,
+                goal_minimum,
+                goal_maximum,
+            )
+            original_undersized_distance = distance_from_ideal(
+                undersized_count,
+                goal_minimum,
+                goal_maximum,
+            )
+            evaluated_shifts = []
+
+            for shift in range(1, equalizing_shift + 1):
+                projected_oversized = oversized_count - shift
+                projected_undersized = undersized_count + shift
+                projected_oversized_status = category_function(
+                    projected_oversized
+                )
+                projected_undersized_status = category_function(
+                    projected_undersized
+                )
+                projected_oversized_distance = distance_from_ideal(
+                    projected_oversized,
+                    goal_minimum,
+                    goal_maximum,
+                )
+                projected_undersized_distance = distance_from_ideal(
+                    projected_undersized,
+                    goal_minimum,
+                    goal_maximum,
+                )
+
+                oversized_is_ideal = projected_oversized_status == "Ideal"
+                undersized_is_ideal = projected_undersized_status == "Ideal"
+                ideal_count = int(oversized_is_ideal) + int(
+                    undersized_is_ideal
+                )
+
+                oversized_materially_improved = materially_improved(
+                    original_oversized_distance,
+                    projected_oversized_distance,
+                )
+                undersized_materially_improved = materially_improved(
+                    original_undersized_distance,
+                    projected_undersized_distance,
+                )
+
+                one_is_ideal = ideal_count == 1
+                other_materially_improved = (
+                    oversized_is_ideal and undersized_materially_improved
+                ) or (
+                    undersized_is_ideal and oversized_materially_improved
+                )
+                total_distance_improvement = (
+                    original_oversized_distance
+                    + original_undersized_distance
+                    - projected_oversized_distance
+                    - projected_undersized_distance
+                )
+
+                if one_is_ideal and other_materially_improved:
+                    priority = "Medium"
+                    priority_rank = 2
+                else:
+                    priority = "Low"
+                    priority_rank = 1
+
+                evaluated_shifts.append(
+                    {
+                        "shift": shift,
+                        "priority": priority,
+                        "priority_rank": priority_rank,
+                        "ideal_count": ideal_count,
+                        "projected_oversized": projected_oversized,
+                        "projected_undersized": projected_undersized,
+                        "projected_oversized_distance": (
+                            projected_oversized_distance
+                        ),
+                        "projected_undersized_distance": (
+                            projected_undersized_distance
+                        ),
+                        "total_distance_improvement": (
+                            total_distance_improvement
+                        ),
+                    }
+                )
+
+            if not evaluated_shifts:
+                return None
+
+            evaluated_shifts.sort(
+                key=lambda result: (
+                    -result["priority_rank"],
+                    -result["ideal_count"],
+                    -result["total_distance_improvement"],
+                    result["projected_oversized_distance"]
+                    + result["projected_undersized_distance"],
+                    result["shift"],
+                )
+            )
+            best_result = evaluated_shifts[0]
+
+            if best_result["priority"] == "Medium":
+                best_result["why"] = (
+                    f"Shifting approximately {best_result['shift']} addresses "
+                    "brings one territory into the ideal range and materially "
+                    "improves the other territory."
+                )
+            else:
+                best_result["why"] = (
+                    f"Shifting approximately {best_result['shift']} addresses "
+                    "reduces the imbalance, but does not fully resolve both "
+                    "territories."
+                )
+
+            return best_result
+
+        apartment_units_by_territory = (
+            apt_groups.groupby(
+                "Territory_Name",
+                observed=True,
+            )["Total Units"]
+            .sum()
+            .to_dict()
+        )
+
+        territory_metrics = counts_df[
+            [
+                "Territory_Name",
+                "Total_Addresses",
+                "Category",
+            ]
+        ].copy()
+        territory_metrics["Apartment_Units"] = (
+            territory_metrics["Territory_Name"]
+            .map(apartment_units_by_territory)
+            .fillna(0)
+            .astype(int)
+        )
+        territory_metrics["Potential_Count"] = (
+            territory_metrics["Total_Addresses"]
+            - territory_metrics["Apartment_Units"]
+        ).clip(lower=0)
+        territory_metrics["Potential_Status"] = territory_metrics[
+            "Potential_Count"
+        ].apply(get_category)
+        territory_metrics = territory_metrics.set_index("Territory_Name")
+
+        balancing_rows = []
+        spatial_shift_territories = []
+
+        for territory_name, territory_row in territory_metrics.iterrows():
+            raw_count = int(territory_row["Total_Addresses"])
+            current_status = territory_row["Category"]
+            apartment_units = int(territory_row["Apartment_Units"])
+            potential_count = int(territory_row["Potential_Count"])
+            potential_status = territory_row["Potential_Status"]
+
+            if current_status != "Oversized":
+                continue
+
+            if apartment_units > 0 and potential_status == "Ideal":
+                balancing_rows.append(
+                    {
+                        "Oversized Territory": territory_name,
+                        "Balancing Method": "Apartment Conversion",
+                        "Neighbor/Target": "Internal",
+                        "Priority": "High",
+                        "Est. Shift Needed": apartment_units,
+                        "Projected Statuses": (
+                            f"{raw_count} (Oversized) -> "
+                            f"{potential_count} (Ideal)"
+                        ),
+                        "Why": (
+                            "Converting apartments to letter writing brings "
+                            "this territory into the ideal range without "
+                            "border adjustments."
+                        ),
+                    }
+                )
+                continue
+
+            if apartment_units > 0 and potential_status == "Undersized":
+                balancing_rows.append(
+                    {
+                        "Oversized Territory": territory_name,
+                        "Balancing Method": "Apartment Conversion",
+                        "Neighbor/Target": "Internal",
+                        "Priority": "Medium",
+                        "Est. Shift Needed": "Review manually",
+                        "Projected Statuses": (
+                            f"{raw_count} (Oversized) -> "
+                            f"{potential_count} (Undersized)"
+                        ),
+                        "Why": (
+                            "Converting all apartments would overcorrect this "
+                            "territory; consider converting only some buildings "
+                            "or units before adjusting borders."
+                        ),
+                    }
+                )
+                continue
+
+            if potential_status == "Oversized":
+                spatial_shift_territories.append(territory_name)
+
+        terr_geoms = (
+            kml_gdf[["Territory_Name", "geometry_terr"]]
+            .dropna(subset=["Territory_Name", "geometry_terr"])
+            .set_geometry("geometry_terr")
+            .dissolve(by="Territory_Name")
+        )
         terr_geoms["geometry_terr"] = terr_geoms.geometry.make_valid()
-        terr_geoms = terr_geoms[terr_geoms.geometry.notna() & ~terr_geoms.geometry.is_empty].copy()
-        
+        terr_geoms = terr_geoms[
+            terr_geoms.geometry.notna()
+            & ~terr_geoms.geometry.is_empty
+        ].copy()
+
         terr_geoms_metric = terr_geoms.to_crs(metric_crs)
         territory_sindex = terr_geoms_metric.sindex
-
-        count_lookup = counts_df.drop_duplicates("Territory_Name").set_index("Territory_Name")["Total_Addresses"].to_dict()
-        undersized_set = set(undersized)
+        undersized_adjusted_territories = set(
+            territory_metrics.index[
+                territory_metrics["Potential_Status"].eq("Undersized")
+            ]
+        )
         seen_pairs = set()
-        suggestions = []
 
-        for over_name in oversized:
-            if over_name not in terr_geoms_metric.index: continue
-            over_geom = terr_geoms_metric.at[over_name, "geometry_terr"]
-            over_count = count_lookup.get(over_name, 0)
-            proximity_zone = over_geom.buffer(15.0)
+        for oversized_name in spatial_shift_territories:
+            if (
+                oversized_name not in terr_geoms_metric.index
+                or oversized_name not in territory_metrics.index
+            ):
+                continue
 
-            candidate_positions = territory_sindex.query(proximity_zone, predicate="intersects")
+            oversized_adjusted_count = int(
+                territory_metrics.at[oversized_name, "Potential_Count"]
+            )
+            oversized_geom = terr_geoms_metric.at[
+                oversized_name,
+                "geometry_terr",
+            ]
+            proximity_zone = oversized_geom.buffer(15.0)
+            candidate_positions = territory_sindex.query(
+                proximity_zone,
+                predicate="intersects",
+            )
+
             for candidate_position in candidate_positions:
-                under_name = terr_geoms_metric.index[candidate_position]
-                if under_name == over_name or under_name not in undersized_set: continue
-                
-                pair_key = tuple(sorted((str(over_name), str(under_name))))
-                if pair_key in seen_pairs: continue
+                undersized_name = terr_geoms_metric.index[
+                    candidate_position
+                ]
+                if (
+                    undersized_name == oversized_name
+                    or undersized_name
+                    not in undersized_adjusted_territories
+                    or undersized_name not in territory_metrics.index
+                ):
+                    continue
 
-                under_geom = terr_geoms_metric.iloc[candidate_position].geometry_terr
-                if over_geom.distance(under_geom) > 15.0: continue
+                pair_key = tuple(
+                    sorted((str(oversized_name), str(undersized_name)))
+                )
+                if pair_key in seen_pairs:
+                    continue
+
+                undersized_geom = terr_geoms_metric.iloc[
+                    candidate_position
+                ].geometry_terr
+                if oversized_geom.distance(undersized_geom) > 15.0:
+                    continue
 
                 seen_pairs.add(pair_key)
-                under_count = count_lookup.get(under_name, 0)
-                suggestions.append([over_name, over_count, under_name, under_count, ""])
+                undersized_adjusted_count = int(
+                    territory_metrics.at[
+                        undersized_name,
+                        "Potential_Count",
+                    ]
+                )
+                shift_result = evaluate_spatial_shift(
+                    oversized_adjusted_count,
+                    undersized_adjusted_count,
+                    min_goal,
+                    max_goal,
+                    get_category,
+                )
+                if shift_result is None:
+                    continue
 
-        suggestion_df = pd.DataFrame(suggestions, columns=["Too Large", "Count", "Too Small", "Count ", "Recommendation"])
-        suggestion_df.to_excel(writer, sheet_name="Border Rewrites", index=False)
+                projected_oversized = int(
+                    shift_result["projected_oversized"]
+                )
+                projected_undersized = int(
+                    shift_result["projected_undersized"]
+                )
+                shift = int(shift_result["shift"])
+
+                balancing_rows.append(
+                    {
+                        "Oversized Territory": oversized_name,
+                        "Balancing Method": "Spatial Shift",
+                        "Neighbor/Target": undersized_name,
+                        "Priority": shift_result["priority"],
+                        "Est. Shift Needed": shift,
+                        "Projected Statuses": (
+                            f"{oversized_name}: "
+                            f"{status_with_count(projected_oversized, get_category)}"
+                            " | "
+                            f"{undersized_name}: "
+                            f"{status_with_count(projected_undersized, get_category)}"
+                        ),
+                        "Why": (
+                            "(Candidate territories are within the configured "
+                            "15m boundary tolerance). "
+                            f"{shift_result['why']}"
+                        ),
+                    }
+                )
+
+        territory_balancing_df = pd.DataFrame(
+            balancing_rows,
+            columns=balancing_columns,
+        )
+
+        if not territory_balancing_df.empty:
+            priority_order = pd.CategoricalDtype(
+                categories=["High", "Medium", "Low"],
+                ordered=True,
+            )
+            territory_balancing_df["Priority"] = (
+                territory_balancing_df["Priority"].astype(priority_order)
+            )
+            territory_balancing_df["_Method_Order"] = (
+                territory_balancing_df["Balancing Method"].map(
+                    {"Apartment Conversion": 0, "Spatial Shift": 1}
+                )
+            )
+            territory_balancing_df["_Territory_Sort"] = (
+                territory_balancing_df["Oversized Territory"]
+                .astype(str)
+                .str.upper()
+            )
+            territory_balancing_df = (
+                territory_balancing_df.sort_values(
+                    by=[
+                        "Priority",
+                        "_Method_Order",
+                        "_Territory_Sort",
+                        "Neighbor/Target",
+                    ],
+                    kind="stable",
+                )
+                .drop(columns=["_Method_Order", "_Territory_Sort"])
+                .reset_index(drop=True)
+            )
+
+        territory_balancing_df.to_excel(
+            writer,
+            sheet_name="Border Rewrites",
+            index=False,
+        )
         ws5 = writer.sheets["Border Rewrites"]
-        add_excel_table(ws5, suggestion_df, "BorderRewritesTable", show_stripes=True)
+        ws5.freeze_panes = "A2"
 
-        ws5.column_dimensions["A"].width = 18
-        ws5.column_dimensions["C"].width = 18
-        ws5.column_dimensions["E"].width = 85
+        add_excel_table(
+            ws5,
+            territory_balancing_df,
+            "BorderRewritesTable",
+            show_stripes=False,
+        )
 
-        for row_number in range(2, len(suggestions) + 2):
-            suggestion = suggestions[row_number - 2]
-            difference = abs(suggestion[1] - suggestion[3])
-            ws5.cell(row=row_number, column=5).value = CellRichText([
-                "That is a ", TextBlock(bold_inline, f"{difference} address difference"),
-                f". Shrink {suggestion[0]} & Expand {suggestion[2]}."
-            ])
+        balancing_widths = {
+            "A": 18,
+            "B": 22,
+            "C": 18,
+            "D": 12,
+            "E": 16,
+            "F": 45,
+            "G": 80,
+        }
+        for column_letter, width in balancing_widths.items():
+            ws5.column_dimensions[column_letter].width = width
+
+        balancing_header_fill = PatternFill(
+            start_color="046A34",
+            end_color="046A34",
+            fill_type="solid",
+        )
+        balancing_stripe_fill = PatternFill(
+            start_color="F3F3F3",
+            end_color="F3F3F3",
+            fill_type="solid",
+        )
+        balancing_white_fill = PatternFill(
+            start_color="FFFFFF",
+            end_color="FFFFFF",
+            fill_type="solid",
+        )
+        balancing_border = Border(
+            left=Side(style="thin", color="999999"),
+            right=Side(style="thin", color="999999"),
+            top=Side(style="thin", color="999999"),
+            bottom=Side(style="thin", color="999999"),
+        )
+
+        for cell in ws5[1]:
+            cell.fill = balancing_header_fill
+            cell.font = Font(bold=True, color="EAECEB")
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="top",
+                wrap_text=True,
+            )
+
+        for row_number in range(2, len(territory_balancing_df) + 2):
+            row_fill = (
+                balancing_white_fill
+                if row_number % 2 == 0
+                else balancing_stripe_fill
+            )
+            for column_number in range(1, 8):
+                cell = ws5.cell(
+                    row=row_number,
+                    column=column_number,
+                )
+                cell.fill = row_fill
+                cell.border = balancing_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_number in {6, 7} else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=True,
+                )
 
         # --- TAB 6: EXCLUDED AUDIT ---
         if not excluded_gdf.empty:
