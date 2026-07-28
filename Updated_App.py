@@ -2,7 +2,7 @@ import streamlit as st
 import geopandas as gpd
 import pandas as pd
 import openpyxl
-from openpyxl.styles import PatternFill, Alignment, Font
+from openpyxl.styles import PatternFill, Alignment, Font, Border, Side
 from openpyxl.cell.rich_text import TextBlock, CellRichText
 from openpyxl.cell.text import InlineFont
 from openpyxl.worksheet.table import Table, TableStyleInfo
@@ -142,7 +142,8 @@ def build_addresses(row, state):
     street = clean_field(row.get("Canonical_Street"))
     st_type = clean_field(row.get("Canonical_StType"))
     muni = clean_field(row.get("Canonical_Muni"))
-    zip_c = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    zip_c = normalized_zip[:5] if normalized_zip else ""
     unit_str = normalize_unit(row.get("Canonical_Unit"))
 
     full_house_num = f"{house}{house_sx}".strip()
@@ -244,15 +245,23 @@ def parse_mailable_address(row, state):
     state_zip = address_parts[2] if len(address_parts) > 2 else ""
 
     state_value = state
-    zip_code = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    zip_code = normalized_zip[:5] if normalized_zip else ""
+    zip4_code = (
+        normalized_zip.split("-", 1)[1]
+        if "-" in normalized_zip
+        else ""
+    )
     state_zip_match = re.fullmatch(
-        r"([A-Za-z]{2})(?:\s+(\d{5}(?:-\d{4})?))?",
+        r"([A-Za-z]{2})(?:\s+(\d{5})(?:-(\d{4}))?)?",
         state_zip,
     )
     if state_zip_match:
         state_value = state_zip_match.group(1).upper()
         if state_zip_match.group(2):
             zip_code = state_zip_match.group(2)
+        if state_zip_match.group(3):
+            zip4_code = state_zip_match.group(3)
 
     unit_type = ""
     unit_value = clean_field(row.get("Canonical_Unit"))
@@ -328,6 +337,7 @@ def parse_mailable_address(row, state):
             "Municipality": municipality,
             "State": state_value,
             "ZipCode": zip_code,
+            "ZIP4Code": zip4_code,
             "HouseNoPrefix": house_prefix,
             "HouseNoMain": house_main,
             "HouseSx": house_suffix,
@@ -340,7 +350,7 @@ def parse_mailable_address(row, state):
     )
 
 # --- 3. EXCEL GENERATION ENGINE ---
-def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, county_config, apt_threshold, kml_filename, county_filename):
+def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, county_config, apt_threshold, kml_filename, county_filename, duplicate_assignment_count, unassigned_address_count):
     output = io.BytesIO()
     run_timestamp = datetime.datetime.now()
     state = county_config["state"]
@@ -470,7 +480,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         smallest_count = smallest_terr["Total_Addresses"] if smallest_terr is not None else 0
 
         dashboard_top = [
-            [f"Territory Analysis: {cong_name}"],
+            [f"TERRITORY ANALYSIS: {cong_name}".upper()],
             [f"Generated on {run_timestamp.strftime('%Y-%m-%d %H:%M')} by TerritoryToolbox (using the analysis tool)"],
             [""],
             [f"Total Territories: {total_territories}"],
@@ -518,8 +528,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         ws1 = writer.sheets["Dashboard"]
         ws1.column_dimensions["A"].width = 18
-        ws1.column_dimensions["B"].width = 25
-        ws1.column_dimensions["C"].width = 12
+        ws1.column_dimensions["B"].width = 18
+        ws1.column_dimensions["C"].width = 18
 
         ws1["A1"].font = Font(size=20, bold=True, color="0D6B31")
         ws1["A2"].hyperlink = None
@@ -583,9 +593,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             ("Records Flagged with Warnings", flagged_record_count),
             ("KML Filename", kml_filename),
             ("County Source Filename", county_filename),
-            ("Duplicate Boundary Assignments", ""),
-            ("Unassigned Address Records", ""),
-            ("Workbook Schema Version", ""),
+            ("Duplicate Boundary Assignments", duplicate_assignment_count),
+            ("Unassigned Address Records", unassigned_address_count),
         ]
 
         for offset, (label, value) in enumerate(tech_info, start=1):
@@ -601,10 +610,31 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
             label_cell.font = Font(bold=False)
             value_cell.font = Font(bold=False)
-            label_cell.alignment = Alignment(wrap_text=True, vertical="top")
-            value_cell.alignment = Alignment(wrap_text=False, vertical="top")
+            label_cell.alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=True,
+            )
+            value_cell.alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=False,
+            )
 
-        ws1.column_dimensions["C"].width = 28
+        for row in ws1.iter_rows(
+            min_col=2,
+            max_col=3,
+            min_row=1,
+            max_row=ws1.max_row,
+        ):
+            for cell in row:
+                cell.alignment = Alignment(
+                    horizontal="left",
+                    vertical=cell.alignment.vertical or "top",
+                    wrap_text=cell.alignment.wrap_text,
+                )
+
+        ws1.delete_cols(17, 10)
 
         def add_excel_table(worksheet, dataframe, table_name, show_stripes=False):
             if dataframe.empty: return
@@ -676,16 +706,19 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             .rename(
                 columns={
                     "Territory_Name": "Territory Name",
-                    "Total_Addresses": "# of Addresses",
+                    "Total_Addresses": "Total Address Count",
                     "Category": "Current Status",
+                    "Addresses With Apartments Removed": (
+                        "Total Address Count Without Apartments"
+                    ),
                 }
             )[
                 [
                     "Territory Name",
-                    "# of Addresses",
+                    "Total Address Count",
                     "Current Status",
                     "# of Apartment Units",
-                    "Addresses With Apartments Removed",
+                    "Total Address Count Without Apartments",
                     "Potential Status",
                     "Suggested Action",
                 ]
@@ -698,14 +731,15 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             index=False,
         )
         ws2 = writer.sheets["Counts"]
+        ws2.freeze_panes = "B2"
 
         counts_widths = {
-            "A": 22,
-            "B": 22,
-            "C": 22,
-            "D": 22,
-            "E": 28,
-            "F": 22,
+            "A": 14,
+            "B": 14,
+            "C": 18,
+            "D": 14,
+            "E": 18,
+            "F": 18,
             "G": 92,
         }
         for column_letter, width in counts_widths.items():
@@ -718,14 +752,9 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             show_stripes=False,
         )
 
-        red_status_fill = PatternFill(
-            start_color="EA9D9C",
-            end_color="EA9D9C",
-            fill_type="solid",
-        )
-        red_data_fill = PatternFill(
-            start_color="DFC2D0",
-            end_color="DFC2D0",
+        header_fill_counts = PatternFill(
+            start_color="046A34",
+            end_color="046A34",
             fill_type="solid",
         )
         green_status_fill = PatternFill(
@@ -734,66 +763,126 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             fill_type="solid",
         )
         green_data_fill = PatternFill(
-            start_color="E5F2E0",
-            end_color="E5F2E0",
+            start_color="F0F9ED",
+            end_color="F0F9ED",
             fill_type="solid",
+        )
+        red_current_status_fill = PatternFill(
+            start_color="EA9D9C",
+            end_color="EA9D9C",
+            fill_type="solid",
+        )
+        red_potential_status_fill = PatternFill(
+            start_color="DFC2D0",
+            end_color="DFC2D0",
+            fill_type="solid",
+        )
+        red_data_fill = PatternFill(
+            start_color="E3D5DC",
+            end_color="E3D5DC",
+            fill_type="solid",
+        )
+        stripe_fill = PatternFill(
+            start_color="F3F3F3",
+            end_color="F3F3F3",
+            fill_type="solid",
+        )
+        white_fill = PatternFill(
+            start_color="FFFFFF",
+            end_color="FFFFFF",
+            fill_type="solid",
+        )
+        no_action_fill = PatternFill(
+            start_color="C4EFD0",
+            end_color="C4EFD0",
+            fill_type="solid",
+        )
+        bottom_border = Border(
+            bottom=Side(style="thin", color="666666")
         )
 
         for cell in ws2[1]:
-            cell.font = Font(bold=True, color="000000")
+            cell.fill = header_fill_counts
+            cell.font = Font(bold=True, color="EAECEB")
             cell.alignment = Alignment(
                 horizontal="center",
-                vertical="center",
+                vertical="top",
                 wrap_text=True,
             )
-
-        def status_fill(status, status_cell=True):
-            if status == "Ideal":
-                return green_status_fill if status_cell else green_data_fill
-            return red_status_fill if status_cell else red_data_fill
+            cell.border = bottom_border
 
         for row_number in range(2, len(counts_df_sorted) + 2):
             current_status = ws2.cell(row=row_number, column=3).value
             potential_status = ws2.cell(row=row_number, column=6).value
+            suggested_action = ws2.cell(row=row_number, column=7).value
 
-            for column_number in range(1, 8):
-                cell = ws2.cell(row=row_number, column=column_number)
-                cell.font = Font(bold=False, color="000000")
-                cell.alignment = Alignment(
-                    horizontal=("left" if column_number in {1, 7} else "center"),
-                    vertical="center",
-                    wrap_text=column_number in {1, 5, 7},
-                )
-
-            for column_number in {1, 2, 4, 5, 7}:
-                ws2.cell(row=row_number, column=column_number).fill = status_fill(
-                    current_status,
-                    status_cell=False,
-                )
-
-            ws2.cell(row=row_number, column=3).fill = status_fill(
-                current_status,
-                status_cell=True,
+            alternate_fill = (
+                white_fill if row_number % 2 == 0 else stripe_fill
             )
-            ws2.cell(row=row_number, column=6).fill = status_fill(
-                potential_status,
-                status_cell=True,
+            ws2.cell(row=row_number, column=1).fill = alternate_fill
+
+            current_is_ideal = current_status == "Ideal"
+            potential_is_ideal = potential_status == "Ideal"
+
+            current_status_fill = (
+                green_status_fill
+                if current_is_ideal
+                else red_current_status_fill
+            )
+            current_data_fill = (
+                green_data_fill
+                if current_is_ideal
+                else red_data_fill
+            )
+            potential_status_fill = (
+                green_status_fill
+                if potential_is_ideal
+                else red_potential_status_fill
             )
 
-            suggested_action = ws2.cell(
+            for column_number in [2, 4, 5]:
+                ws2.cell(
+                    row=row_number,
+                    column=column_number,
+                ).fill = current_data_fill
+
+            ws2.cell(
+                row=row_number,
+                column=3,
+            ).fill = current_status_fill
+            ws2.cell(
+                row=row_number,
+                column=6,
+            ).fill = potential_status_fill
+            ws2.cell(
                 row=row_number,
                 column=7,
-            ).value
+            ).fill = potential_status_fill
+
+            for column_number in range(1, 8):
+                cell = ws2.cell(
+                    row=row_number,
+                    column=column_number,
+                )
+                cell.font = Font(
+                    bold=column_number == 2,
+                    italic=column_number in {4, 5, 6},
+                    color="000000",
+                )
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_number in {1, 7} else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=True,
+                )
+                cell.border = bottom_border
+
             if (
                 current_status == "Ideal"
                 and potential_status == "Ideal"
                 and suggested_action == "No action needed"
             ):
-                no_action_fill = PatternFill(
-                    start_color="C4EFD0",
-                    end_color="C4EFD0",
-                    fill_type="solid",
-                )
                 for column_number in range(1, 8):
                     cell = ws2.cell(
                         row=row_number,
@@ -801,10 +890,11 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     )
                     cell.font = Font(bold=True, color="000000")
                     cell.fill = no_action_fill
+                    cell.border = bottom_border
 
         # --- TAB 3: ADDRESS LIST ---
-        valid_gdf["Latitude"] = valid_gdf.geometry.y
-        valid_gdf["Longitude"] = valid_gdf.geometry.x
+        valid_gdf["Latitude"] = valid_gdf.geometry.y.astype(float)
+        valid_gdf["Longitude"] = valid_gdf.geometry.x.astype(float)
         valid_gdf[
             [
                 "HouseNum_Sort",
@@ -846,6 +936,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 "Municipality",
                 "State",
                 "ZipCode",
+                "ZIP4Code",
                 "HouseNoPrefix",
                 "HouseNoMain",
                 "HouseSx",
@@ -874,6 +965,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             index=False,
         )
         ws3 = writer.sheets["Address List"]
+        ws3.freeze_panes = "C2"
 
         address_table = Table(
             displayName="AddressListTable",
@@ -901,15 +993,23 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             "P",
             "Q",
             "R",
+            "S",
         ]
         for column_letter in hidden_address_columns:
             ws3.column_dimensions[column_letter].hidden = True
 
-        ws3.column_dimensions["A"].width = 20
-        ws3.column_dimensions["B"].width = 55
-        ws3.column_dimensions["R"].width = 22
-        ws3.column_dimensions["S"].width = 38
+        ws3.column_dimensions["A"].width = 14
+        ws3.column_dimensions["B"].width = 16
+        ws3.column_dimensions["Q"].width = 25
+        ws3.column_dimensions["R"].width = 25
+        ws3.column_dimensions["S"].width = 36
+        ws3.column_dimensions["T"].width = 38
 
+        header_fill = PatternFill(
+            start_color="046A34",
+            end_color="046A34",
+            fill_type="solid",
+        )
         stripe_fill = PatternFill(
             start_color="F3F3F3",
             end_color="F3F3F3",
@@ -925,22 +1025,21 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             end_color="EA9F9D",
             fill_type="solid",
         )
+        address_border = Border(
+            left=Side(style="thin", color="999999"),
+            right=Side(style="thin", color="999999"),
+            top=Side(style="thin", color="999999"),
+            bottom=Side(style="thin", color="999999"),
+        )
 
-        for row_number in range(1, len(export_df) + 2):
-            row_fill = stripe_fill if row_number % 2 == 1 else white_fill
-            for column_number in range(1, len(export_df.columns) + 1):
-                cell = ws3.cell(
-                    row=row_number,
-                    column=column_number,
-                )
-                cell.fill = row_fill
-                if row_number == 1:
-                    cell.font = Font(bold=True, color="000000")
-                    cell.alignment = Alignment(
-                        horizontal="center",
-                        vertical="center",
-                        wrap_text=True,
-                    )
+        for cell in ws3[1]:
+            cell.fill = header_fill
+            cell.font = Font(bold=True, color="EAECEB")
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="top",
+                wrap_text=True,
+            )
 
         source_record_column = (
             export_df.columns.get_loc("Source record ID") + 1
@@ -952,6 +1051,32 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         )
 
         for row_number in range(2, len(export_df) + 2):
+            row_fill = (
+                white_fill if row_number % 2 == 0 else stripe_fill
+            )
+            for column_number in range(1, len(export_df.columns) + 1):
+                ws3.cell(
+                    row=row_number,
+                    column=column_number,
+                ).fill = row_fill
+
+            ws3.cell(
+                row=row_number,
+                column=1,
+            ).alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=True,
+            )
+            ws3.cell(
+                row=row_number,
+                column=2,
+            ).alignment = Alignment(
+                horizontal="left",
+                vertical="center",
+                wrap_text=True,
+            )
+
             source_id_cell = ws3.cell(
                 row=row_number,
                 column=source_record_column,
@@ -982,6 +1107,12 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                         row=row_number,
                         column=column_number,
                     ).fill = quality_warning_fill
+
+            for column_number in [1, 2, source_record_column]:
+                ws3.cell(
+                    row=row_number,
+                    column=column_number,
+                ).border = address_border
 
         # --- TAB 4: APARTMENTS ---
         if not counts_df.empty:
@@ -1054,12 +1185,13 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 columns={
                     "Territory_Name": "Territory Name",
                     "Base_Address": "Base Address",
+                    "Total Units": "Units",
                 }
             )[
                 [
                     "Territory Name",
                     "Base Address",
-                    "Total Units",
+                    "Units",
                     "Current Territory Status",
                     "Total Addresses in Territory",
                     "Suggested Action",
@@ -1078,7 +1210,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 columns=[
                     "Territory Name",
                     "Base Address",
-                    "Total Units",
+                    "Units",
                     "Current Territory Status",
                     "Total Addresses in Territory",
                     "Suggested Action",
@@ -1099,6 +1231,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             index=False,
         )
         ws4 = writer.sheets["Apartments"]
+        ws4.freeze_panes = "D2"
 
         apartment_table = Table(
             displayName="ApartmentsTable",
@@ -1110,12 +1243,20 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         ws4.add_table(apartment_table)
 
         apartment_widths = {
-            "A": 30,
-            "B": 40,
-            "C": 15,
-            "D": 24,
-            "E": 24,
+            "A": 14,
+            "B": 43,
+            "C": 11,
+            "D": 18,
+            "E": 18,
             "F": 92,
+            "G": 18,
+            "H": 18,
+            "I": 18,
+            "J": 18,
+            "K": 18,
+            "L": 18,
+            "M": 18,
+            "N": 57,
         }
         for column_letter, width in apartment_widths.items():
             ws4.column_dimensions[column_letter].width = width
@@ -1123,6 +1264,13 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         for column_letter in ["G", "H", "I", "J", "K", "L", "M", "N"]:
             ws4.column_dimensions[column_letter].hidden = True
 
+        ws4.delete_cols(15, 12)
+
+        header_fill = PatternFill(
+            start_color="046A34",
+            end_color="046A34",
+            fill_type="solid",
+        )
         stripe_fill = PatternFill(
             start_color="F3F3F3",
             end_color="F3F3F3",
@@ -1133,9 +1281,26 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             end_color="FFFFFF",
             fill_type="solid",
         )
+        apartment_border = Border(
+            left=Side(style="thin", color="999999"),
+            right=Side(style="thin", color="999999"),
+            top=Side(style="thin", color="999999"),
+            bottom=Side(style="thin", color="999999"),
+        )
 
-        for row_number in range(1, len(apt_export) + 2):
-            row_fill = stripe_fill if row_number % 2 == 1 else white_fill
+        for cell in ws4[1]:
+            cell.fill = header_fill
+            cell.font = Font(bold=True, color="EAECEB")
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="top",
+                wrap_text=True,
+            )
+
+        for row_number in range(2, len(apt_export) + 2):
+            row_fill = (
+                white_fill if row_number % 2 == 0 else stripe_fill
+            )
             for column_number in range(1, len(apt_export.columns) + 1):
                 cell = ws4.cell(
                     row=row_number,
@@ -1143,12 +1308,20 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 )
                 cell.fill = row_fill
                 cell.alignment = Alignment(
-                    horizontal=("left" if column_number in {1, 2, 6, 14} else "center"),
+                    horizontal=(
+                        "left"
+                        if column_number in {1, 2, 6, 14}
+                        else "center"
+                    ),
                     vertical="center",
-                    wrap_text=column_number in {1, 2, 4, 5, 6, 13, 14},
+                    wrap_text=True,
                 )
-                if row_number == 1:
-                    cell.font = Font(bold=True, color="000000")
+
+            for column_number in [1, 2, 3]:
+                ws4.cell(
+                    row=row_number,
+                    column=column_number,
+                ).border = apartment_border
 
         # --- TAB 5: BORDER REWRITES ---
         oversized = counts_df.loc[counts_df["Category"].eq("Oversized"), "Territory_Name"].tolist() if not counts_df.empty else []
@@ -1236,9 +1409,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             writer.sheets["Excluded Audit"].cell(row=2, column=1, value="No addresses were excluded in this map area.")
 
         # --- EXCEL UX POLISH ---
-        for tab_name in ["Counts", "Address List", "Apartments", "Border Rewrites", "Excluded Audit"]:
-            ws = writer.sheets[tab_name]
-            ws.freeze_panes = "A2"
+        writer.sheets["Border Rewrites"].freeze_panes = "A2"
+        writer.sheets["Excluded Audit"].freeze_panes = "A2"
 
         writer.sheets["Dashboard"].sheet_properties.tabColor = "1E90FF"
         writer.sheets["Counts"].sheet_properties.tabColor = "32CD32"
@@ -1325,8 +1497,22 @@ if uploaded_kml:
                 parcel_join_gdf = parcel_gdf.set_geometry("_join_point")
                 kml_gdf = kml_gdf.rename(columns={"geometry": "geometry_terr"}).set_geometry("geometry_terr")
 
-                joined_gdf = gpd.sjoin(parcel_join_gdf, kml_gdf[["Territory_Name", "geometry_terr"]], how="inner", predicate="covered_by")
-                joined_gdf = joined_gdf.dropna(subset=["Territory_Name"]).copy()
+                joined_gdf = gpd.sjoin(
+                    parcel_join_gdf,
+                    kml_gdf[["Territory_Name", "geometry_terr"]],
+                    how="inner",
+                    predicate="covered_by",
+                )
+                joined_gdf = joined_gdf.dropna(
+                    subset=["Territory_Name"]
+                ).copy()
+                assigned_source_count = joined_gdf[
+                    "Source_Record_ID"
+                ].nunique()
+                unassigned_address_count = max(
+                    len(parcel_join_gdf) - assigned_source_count,
+                    0,
+                )
 
                 joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
                 joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
@@ -1351,7 +1537,12 @@ if uploaded_kml:
 
                 excel_file = generate_excel_report(
                     joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""), 
-                    county_config, apt_threshold=apartment_threshold, kml_filename=uploaded_kml.name, county_filename=county_config["file_path"]
+                    county_config,
+                    apt_threshold=apartment_threshold,
+                    kml_filename=uploaded_kml.name,
+                    county_filename=county_config["file_path"],
+                    duplicate_assignment_count=duplicate_assignment_count,
+                    unassigned_address_count=unassigned_address_count,
                 )
                 
                 safe_congregation_name = re.sub(
