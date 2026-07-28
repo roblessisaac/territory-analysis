@@ -1353,8 +1353,10 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         def materially_improved(original_distance, projected_distance):
             if original_distance <= 0:
                 return False
+
             improvement = original_distance - projected_distance
             proportional_improvement = improvement / original_distance
+
             return improvement >= 10 or proportional_improvement >= 0.25
 
         def evaluate_spatial_shift(
@@ -1364,24 +1366,49 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             goal_maximum,
             category_function,
         ):
-            equalizing_shift = max(int((source_count - target_count) // 2), 0)
+            equalizing_shift = max(
+                int((source_count - target_count) // 2),
+                0,
+            )
+
             if equalizing_shift < 1:
                 return None
 
+            minimum_for_source_to_be_ideal = max(
+                source_count - goal_maximum,
+                0,
+            )
+            minimum_for_target_to_be_ideal = max(
+                goal_minimum - target_count,
+                0,
+            )
             minimum_to_make_both_ideal = max(
-                max(source_count - goal_maximum, 0),
-                max(goal_minimum - target_count, 0),
+                minimum_for_source_to_be_ideal,
+                minimum_for_target_to_be_ideal,
+            )
+
+            maximum_that_keeps_source_ideal = max(
+                source_count - goal_minimum,
+                0,
+            )
+            maximum_that_keeps_target_ideal = max(
+                goal_maximum - target_count,
+                0,
             )
             maximum_for_both_ideal = min(
-                max(source_count - goal_minimum, 0),
-                max(goal_maximum - target_count, 0),
+                maximum_that_keeps_source_ideal,
+                maximum_that_keeps_target_ideal,
                 equalizing_shift,
             )
 
-            if 1 <= minimum_to_make_both_ideal <= maximum_for_both_ideal:
+            if (
+                minimum_to_make_both_ideal >= 1
+                and minimum_to_make_both_ideal <= maximum_for_both_ideal
+            ):
                 shift = int(minimum_to_make_both_ideal)
                 projected_source = source_count - shift
                 projected_target = target_count + shift
+
                 return {
                     "shift": shift,
                     "priority": "High",
@@ -1403,13 +1430,20 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 goal_minimum,
                 goal_maximum,
             )
+
             evaluated_shifts = []
 
             for shift in range(1, equalizing_shift + 1):
                 projected_source = source_count - shift
                 projected_target = target_count + shift
-                projected_source_status = category_function(projected_source)
-                projected_target_status = category_function(projected_target)
+
+                projected_source_status = category_function(
+                    projected_source
+                )
+                projected_target_status = category_function(
+                    projected_target
+                )
+
                 projected_source_distance = distance_from_ideal(
                     projected_source,
                     goal_minimum,
@@ -1420,9 +1454,11 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     goal_minimum,
                     goal_maximum,
                 )
+
                 source_is_ideal = projected_source_status == "Ideal"
                 target_is_ideal = projected_target_status == "Ideal"
                 ideal_count = int(source_is_ideal) + int(target_is_ideal)
+
                 source_materially_improved = materially_improved(
                     original_source_distance,
                     projected_source_distance,
@@ -1431,34 +1467,45 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     original_target_distance,
                     projected_target_distance,
                 )
+
                 one_is_ideal = ideal_count == 1
                 other_materially_improved = (
                     source_is_ideal and target_materially_improved
                 ) or (
                     target_is_ideal and source_materially_improved
                 )
+
                 total_distance_improvement = (
                     original_source_distance
                     + original_target_distance
                     - projected_source_distance
                     - projected_target_distance
                 )
-                priority = (
-                    "Medium"
-                    if one_is_ideal and other_materially_improved
-                    else "Low"
-                )
+
+                if one_is_ideal and other_materially_improved:
+                    priority = "Medium"
+                    priority_rank = 2
+                else:
+                    priority = "Low"
+                    priority_rank = 1
+
                 evaluated_shifts.append(
                     {
                         "shift": shift,
                         "priority": priority,
-                        "priority_rank": 2 if priority == "Medium" else 1,
+                        "priority_rank": priority_rank,
                         "ideal_count": ideal_count,
                         "projected_source": projected_source,
                         "projected_target": projected_target,
-                        "projected_source_distance": projected_source_distance,
-                        "projected_target_distance": projected_target_distance,
-                        "total_distance_improvement": total_distance_improvement,
+                        "projected_source_distance": (
+                            projected_source_distance
+                        ),
+                        "projected_target_distance": (
+                            projected_target_distance
+                        ),
+                        "total_distance_improvement": (
+                            total_distance_improvement
+                        ),
                     }
                 )
 
@@ -1470,12 +1517,16 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     -result["priority_rank"],
                     -result["ideal_count"],
                     -result["total_distance_improvement"],
-                    result["projected_source_distance"]
-                    + result["projected_target_distance"],
+                    (
+                        result["projected_source_distance"]
+                        + result["projected_target_distance"]
+                    ),
                     result["shift"],
                 )
             )
+
             best_result = evaluated_shifts[0]
+
             if best_result["priority"] == "Medium":
                 best_result["why"] = (
                     f"Shifting {best_result['shift']} addresses brings one "
@@ -1487,34 +1538,51 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     f"Shifting {best_result['shift']} addresses improves the "
                     "imbalance but does not fully resolve both territories."
                 )
+
             return best_result
 
         apartment_units_by_territory = (
-            apt_groups.groupby("Territory_Name", observed=True)["Total Units"]
+            apt_groups.groupby(
+                "Territory_Name",
+                observed=True,
+            )["Total Units"]
             .sum()
             .to_dict()
         )
+
         territory_metrics = counts_df[
-            ["Territory_Name", "Total_Addresses", "Category"]
+            [
+                "Territory_Name",
+                "Total_Addresses",
+                "Category",
+            ]
         ].copy()
+
         territory_metrics["Apartment_Units"] = (
             territory_metrics["Territory_Name"]
             .map(apartment_units_by_territory)
             .fillna(0)
             .astype(int)
         )
+
         territory_metrics["Potential_Count"] = (
             territory_metrics["Total_Addresses"]
             - territory_metrics["Apartment_Units"]
         ).clip(lower=0)
+
         territory_metrics["Potential_Status"] = territory_metrics[
             "Potential_Count"
         ].apply(get_category)
+
         territory_metrics["Shift_Baseline_Count"] = territory_metrics[
             "Total_Addresses"
         ]
         territory_metrics["Resolved"] = False
-        territory_metrics = territory_metrics.set_index("Territory_Name")
+
+        territory_metrics = territory_metrics.set_index(
+            "Territory_Name"
+        )
+
         balancing_rows = []
 
         # Phase 1: Reductions.
@@ -1524,6 +1592,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             apartment_units = int(territory_row["Apartment_Units"])
             potential_count = int(territory_row["Potential_Count"])
             potential_status = territory_row["Potential_Status"]
+
             if current_status != "Oversized" or apartment_units <= 0:
                 continue
 
@@ -1536,16 +1605,21 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                         "Priority": "High",
                         "Addresses Affected": apartment_units,
                         "Projected Statuses": (
-                            f"{raw_count} (Oversized) -> {potential_count} (Ideal)"
+                            f"{raw_count} (Oversized) -> "
+                            f"{potential_count} (Ideal)"
                         ),
                         "Why": (
-                            "Converting all apartments to letter writing brings "
-                            "this territory into the ideal range without border "
-                            "adjustments."
+                            "Converting all apartments to letter writing "
+                            "brings this territory into the ideal range "
+                            "without border adjustments."
                         ),
                     }
                 )
-                territory_metrics.at[territory_name, "Resolved"] = True
+                territory_metrics.at[
+                    territory_name,
+                    "Resolved",
+                ] = True
+
             elif potential_status == "Oversized":
                 balancing_rows.append(
                     {
@@ -1559,9 +1633,9 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                             f"{potential_count} (Oversized)"
                         ),
                         "Why": (
-                            "Converting all apartments reduces bloat, but the "
-                            "territory remains oversized. A border shift is "
-                            "still required."
+                            "Converting all apartments reduces bloat, but "
+                            "the territory remains oversized. A border shift "
+                            "is still required."
                         ),
                     }
                 )
@@ -1569,6 +1643,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     territory_name,
                     "Shift_Baseline_Count",
                 ] = potential_count
+
             elif potential_status == "Undersized":
                 balancing_rows.append(
                     {
@@ -1591,15 +1666,31 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 )
 
         terr_geoms = (
-            kml_gdf[["Territory_Name", "geometry_terr"]]
-            .dropna(subset=["Territory_Name", "geometry_terr"])
+            kml_gdf[
+                [
+                    "Territory_Name",
+                    "geometry_terr",
+                ]
+            ]
+            .dropna(
+                subset=[
+                    "Territory_Name",
+                    "geometry_terr",
+                ]
+            )
             .set_geometry("geometry_terr")
             .dissolve(by="Territory_Name")
         )
-        terr_geoms["geometry_terr"] = terr_geoms.geometry.make_valid()
+
+        terr_geoms["geometry_terr"] = (
+            terr_geoms.geometry.make_valid()
+        )
+
         terr_geoms = terr_geoms[
-            terr_geoms.geometry.notna() & ~terr_geoms.geometry.is_empty
+            terr_geoms.geometry.notna()
+            & ~terr_geoms.geometry.is_empty
         ].copy()
+
         terr_geoms_metric = terr_geoms.to_crs(metric_crs)
         territory_sindex = terr_geoms_metric.sindex
 
@@ -1610,45 +1701,75 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 & ~territory_metrics["Resolved"]
             ]
         )
-        seen_consolidation_pairs = set()
-        for territory_name in sorted(unresolved_undersized, key=natural_keys):
-            if territory_name not in unresolved_undersized:
+
+        consolidation_pairs = set()
+
+        for territory_name in sorted(
+            unresolved_undersized,
+            key=natural_keys,
+        ):
+            if (
+                territory_name not in terr_geoms_metric.index
+                or territory_name not in unresolved_undersized
+            ):
                 continue
-            if territory_name not in terr_geoms_metric.index:
-                continue
-            territory_geom = terr_geoms_metric.at[territory_name, "geometry_terr"]
+
+            territory_geom = terr_geoms_metric.at[
+                territory_name,
+                "geometry_terr",
+            ]
+
             candidate_positions = territory_sindex.query(
-                territory_geom.buffer(15.0),
+                territory_geom.buffer(45.0),
                 predicate="intersects",
             )
+
             for candidate_position in candidate_positions:
-                neighbor_name = terr_geoms_metric.index[candidate_position]
+                neighbor_name = terr_geoms_metric.index[
+                    candidate_position
+                ]
+
                 if (
                     neighbor_name == territory_name
                     or neighbor_name not in unresolved_undersized
                 ):
                     continue
-                pair_key = tuple(sorted((str(territory_name), str(neighbor_name))))
-                if pair_key in seen_consolidation_pairs:
+
+                pair_key = tuple(
+                    sorted(
+                        (
+                            str(territory_name),
+                            str(neighbor_name),
+                        )
+                    )
+                )
+
+                if pair_key in consolidation_pairs:
                     continue
+
                 neighbor_geom = terr_geoms_metric.iloc[
                     candidate_position
                 ].geometry_terr
-                if territory_geom.distance(neighbor_geom) > 15.0:
+
+                if territory_geom.distance(neighbor_geom) > 45.0:
                     continue
+
                 combined_count = int(
-                    territory_metrics.at[territory_name, "Total_Addresses"]
-                    + territory_metrics.at[neighbor_name, "Total_Addresses"]
+                    territory_metrics.at[
+                        territory_name,
+                        "Total_Addresses",
+                    ]
+                    + territory_metrics.at[
+                        neighbor_name,
+                        "Total_Addresses",
+                    ]
                 )
+
                 if get_category(combined_count) != "Ideal":
                     continue
-                seen_consolidation_pairs.add(pair_key)
-                first_count = int(
-                    territory_metrics.at[territory_name, "Total_Addresses"]
-                )
-                second_count = int(
-                    territory_metrics.at[neighbor_name, "Total_Addresses"]
-                )
+
+                consolidation_pairs.add(pair_key)
+
                 balancing_rows.append(
                     {
                         "Territory": territory_name,
@@ -1657,64 +1778,117 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                         "Priority": "High",
                         "Addresses Affected": "Merge",
                         "Projected Statuses": (
-                            f"{territory_name}: {first_count} (Undersized) + "
-                            f"{neighbor_name}: {second_count} (Undersized) -> "
-                            f"{combined_count} (Ideal)"
+                            f"{territory_name}: "
+                            f"{int(territory_metrics.at[territory_name, 'Total_Addresses'])} "
+                            f"(Undersized) + {neighbor_name}: "
+                            f"{int(territory_metrics.at[neighbor_name, 'Total_Addresses'])} "
+                            f"(Undersized) -> {combined_count} (Ideal)"
                         ),
                         "Why": (
                             "Merging these adjacent undersized territories "
-                            "creates a single ideal territory and reduces map "
-                            "bloat."
+                            "creates a single ideal territory and reduces "
+                            "map bloat."
                         ),
                     }
                 )
-                territory_metrics.at[territory_name, "Resolved"] = True
-                territory_metrics.at[neighbor_name, "Resolved"] = True
+
+                territory_metrics.at[
+                    territory_name,
+                    "Resolved",
+                ] = True
+                territory_metrics.at[
+                    neighbor_name,
+                    "Resolved",
+                ] = True
+
                 unresolved_undersized.discard(territory_name)
                 unresolved_undersized.discard(neighbor_name)
                 break
 
-        # Phase 3: Border shifts.
-        unresolved_names = set(
-            territory_metrics.index[~territory_metrics["Resolved"]]
-        )
-        shift_sources = [
-            name
-            for name in unresolved_names
-            if get_category(
-                int(territory_metrics.at[name, "Shift_Baseline_Count"])
-            ) == "Oversized"
+        # Phase 3: Border Shifts.
+        unresolved_territories = territory_metrics.index[
+            ~territory_metrics["Resolved"]
         ]
+
+        shift_sources = [
+            territory_name
+            for territory_name in unresolved_territories
+            if get_category(
+                int(
+                    territory_metrics.at[
+                        territory_name,
+                        "Shift_Baseline_Count",
+                    ]
+                )
+            )
+            == "Oversized"
+        ]
+
         seen_shift_pairs = set()
+
         for source_name in shift_sources:
             if source_name not in terr_geoms_metric.index:
                 continue
+
             source_count = int(
-                territory_metrics.at[source_name, "Shift_Baseline_Count"]
+                territory_metrics.at[
+                    source_name,
+                    "Shift_Baseline_Count",
+                ]
             )
-            source_geom = terr_geoms_metric.at[source_name, "geometry_terr"]
+
+            source_geom = terr_geoms_metric.at[
+                source_name,
+                "geometry_terr",
+            ]
+
             candidate_positions = territory_sindex.query(
-                source_geom.buffer(15.0),
+                source_geom.buffer(45.0),
                 predicate="intersects",
             )
+
             for candidate_position in candidate_positions:
-                target_name = terr_geoms_metric.index[candidate_position]
-                if target_name == source_name or target_name not in unresolved_names:
+                target_name = terr_geoms_metric.index[
+                    candidate_position
+                ]
+
+                if (
+                    target_name == source_name
+                    or target_name not in unresolved_territories
+                ):
                     continue
+
                 target_count = int(
-                    territory_metrics.at[target_name, "Shift_Baseline_Count"]
+                    territory_metrics.at[
+                        target_name,
+                        "Shift_Baseline_Count",
+                    ]
                 )
+
                 if get_category(target_count) != "Undersized":
                     continue
-                pair_key = tuple(sorted((str(source_name), str(target_name))))
+
+                pair_key = tuple(
+                    sorted(
+                        (
+                            str(source_name),
+                            str(target_name),
+                        )
+                    )
+                )
+
                 if pair_key in seen_shift_pairs:
                     continue
+
                 target_geom = terr_geoms_metric.iloc[
                     candidate_position
                 ].geometry_terr
-                if source_geom.distance(target_geom) > 15.0:
+
+                if source_geom.distance(target_geom) > 45.0:
                     continue
+
                 seen_shift_pairs.add(pair_key)
+
                 shift_result = evaluate_spatial_shift(
                     source_count,
                     target_count,
@@ -1722,17 +1896,26 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     max_goal,
                     get_category,
                 )
+
                 if shift_result is None:
                     continue
-                projected_source = int(shift_result["projected_source"])
-                projected_target = int(shift_result["projected_target"])
+
+                projected_source = int(
+                    shift_result["projected_source"]
+                )
+                projected_target = int(
+                    shift_result["projected_target"]
+                )
+
                 balancing_rows.append(
                     {
                         "Territory": source_name,
                         "Action Type": "Border Shift",
                         "Target Territory": target_name,
                         "Priority": shift_result["priority"],
-                        "Addresses Affected": int(shift_result["shift"]),
+                        "Addresses Affected": int(
+                            shift_result["shift"]
+                        ),
                         "Projected Statuses": (
                             f"{source_name}: "
                             f"{status_with_count(projected_source, get_category)}"
@@ -1742,7 +1925,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                         ),
                         "Why": (
                             "(Candidate territories are within the configured "
-                            "15m boundary tolerance). "
+                            "45m boundary tolerance). "
                             f"{shift_result['why']}"
                         ),
                     }
@@ -1752,14 +1935,23 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             balancing_rows,
             columns=balancing_columns,
         )
+
         if not territory_balancing_df.empty:
             priority_order = pd.CategoricalDtype(
-                categories=["High", "Medium", "Low"],
+                categories=[
+                    "High",
+                    "Medium",
+                    "Low",
+                ],
                 ordered=True,
             )
+
             territory_balancing_df["Priority"] = (
-                territory_balancing_df["Priority"].astype(priority_order)
+                territory_balancing_df["Priority"].astype(
+                    priority_order
+                )
             )
+
             territory_balancing_df["_Action_Order"] = (
                 territory_balancing_df["Action Type"].map(
                     {
@@ -1770,9 +1962,13 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     }
                 )
             )
+
             territory_balancing_df["_Territory_Sort"] = (
-                territory_balancing_df["Territory"].astype(str).str.upper()
+                territory_balancing_df["Territory"]
+                .astype(str)
+                .str.upper()
             )
+
             territory_balancing_df = (
                 territory_balancing_df.sort_values(
                     by=[
@@ -1783,7 +1979,12 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     ],
                     kind="stable",
                 )
-                .drop(columns=["_Action_Order", "_Territory_Sort"])
+                .drop(
+                    columns=[
+                        "_Action_Order",
+                        "_Territory_Sort",
+                    ]
+                )
                 .reset_index(drop=True)
             )
 
@@ -1792,14 +1993,17 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             sheet_name="Border Rewrites",
             index=False,
         )
+
         ws5 = writer.sheets["Border Rewrites"]
         ws5.freeze_panes = "A2"
+
         add_excel_table(
             ws5,
             territory_balancing_df,
             "BorderRewritesTable",
             show_stripes=False,
         )
+
         balancing_widths = {
             "A": 18,
             "B": 22,
@@ -1809,6 +2013,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             "F": 45,
             "G": 80,
         }
+
         for column_letter, width in balancing_widths.items():
             ws5.column_dimensions[column_letter].width = width
 
@@ -1833,27 +2038,41 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             top=Side(style="thin", color="999999"),
             bottom=Side(style="thin", color="999999"),
         )
+
         for cell in ws5[1]:
             cell.fill = balancing_header_fill
-            cell.font = Font(bold=True, color="EAECEB")
+            cell.font = Font(
+                bold=True,
+                color="EAECEB",
+            )
             cell.alignment = Alignment(
                 horizontal="center",
                 vertical="top",
                 wrap_text=True,
             )
-        for row_number in range(2, len(territory_balancing_df) + 2):
+
+        for row_number in range(
+            2,
+            len(territory_balancing_df) + 2,
+        ):
             row_fill = (
                 balancing_white_fill
                 if row_number % 2 == 0
                 else balancing_stripe_fill
             )
+
             for column_number in range(1, 8):
-                cell = ws5.cell(row=row_number, column=column_number)
+                cell = ws5.cell(
+                    row=row_number,
+                    column=column_number,
+                )
                 cell.fill = row_fill
                 cell.border = balancing_border
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {6, 7} else "center"
+                        "left"
+                        if column_number in {6, 7}
+                        else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
