@@ -49,12 +49,12 @@ REQUIRED_CANONICAL_COLUMNS = [
 ]
 
 # --- 1. CONFIGURATION & UI SETUP ---
-st.set_page_config(page_title="Territory Audit Engine", layout="wide")
+st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide")
 
-st.title("Congregation Territory Analysis Engine")
+st.title("TerritoryToolbox's Analysis Engine")
 st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
 
-st.sidebar.header("Step 1: Configuration")
+st.sidebar.header("Step 1: Enter Your Analysis Details")
 congregation_name = st.sidebar.text_input("Congregation Name (No Spaces)", "ExampleCongregation")
 selected_county = st.sidebar.selectbox("Select County Data", list(COUNTY_CONFIGS.keys()))
 goal_range = st.sidebar.selectbox(
@@ -71,12 +71,13 @@ with st.sidebar.expander("Advanced Settings"):
     )
     county_excluded_statuses = COUNTY_CONFIGS[selected_county]["excluded_statuses"]
     selected_excluded_statuses = st.multiselect(
-        "Excluded Audit Controls",
+        f"{selected_county} Excluded Audit Controls",
         options=county_excluded_statuses,
         default=county_excluded_statuses,
+        key=f"excluded_audit_controls_{selected_county}",
     )
 
-st.header("Step 2: Upload Territory Map")
+st.header("Step 2: Upload Your Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
 
 MIN_GOAL, MAX_GOAL = [int(x) for x in goal_range.split("-")]
@@ -510,9 +511,10 @@ def generate_excel_report(
         smallest_count = smallest_terr["Total_Addresses"] if smallest_terr is not None else 0
 
         dashboard_top = [
-            ["TERRITORYTOOLBOX ANALYSIS ENGINE"],
+            [f"Territory Analysis for {cong_name}"],
             [f"Generated on {run_timestamp.strftime('%Y-%m-%d %H:%M')} by TerritoryToolbox (using the analysis tool)"],
             [""],
+            ["Quick Facts:"],
             [f"Total Territories: {total_territories}"],
             [f"Total Valid Addresses: {total_addresses}"],
             [f"Excluded Addresses (See Tab 6): {len(excluded_gdf)}"],
@@ -520,9 +522,14 @@ def generate_excel_report(
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
             [f"Ideal Address Range: ({min_goal}-{max_goal})"],
-            [""]
+            [f"About {ideal_pct:.1f}% of territories fall within this range."],
         ]
-        pd.DataFrame(dashboard_top).to_excel(writer, sheet_name="Dashboard", index=False, header=False)
+        pd.DataFrame(dashboard_top).to_excel(
+            writer,
+            sheet_name="Dashboard",
+            index=False,
+            header=False,
+        )
 
         fixed_bins = [
             ("Under 25", counts_df["Total_Addresses"] < 25),
@@ -532,7 +539,7 @@ def generate_excel_report(
             ("100-125", counts_df["Total_Addresses"].between(100, 125, inclusive="both")),
             ("126-150", counts_df["Total_Addresses"].between(126, 150, inclusive="both")),
             ("151-175", counts_df["Total_Addresses"].between(151, 175, inclusive="both")),
-            ("Over 175", counts_df["Total_Addresses"] > 175)
+            ("Over 175", counts_df["Total_Addresses"] > 175),
         ]
 
         distribution = []
@@ -540,78 +547,150 @@ def generate_excel_report(
             range_rows = counts_df.loc[range_mask]
             range_count = len(range_rows)
             range_categories = range_rows["Category"].dropna().astype(str).unique().tolist()
-            
-            if len(range_categories) == 1: range_category = range_categories[0]
-            elif len(range_categories) > 1: range_category = "Mixed"
+
+            if len(range_categories) == 1:
+                range_category = range_categories[0]
+            elif len(range_categories) > 1:
+                range_category = "Mixed"
             else:
-                if range_label == "Under 25": r_min, r_max = 0, 24
-                elif range_label == "Over 175": r_min, r_max = 176, float("inf")
-                else: r_min, r_max = [int(v) for v in range_label.split("-")]
-                
-                if r_max < min_goal: range_category = "Undersized"
-                elif r_min > max_goal: range_category = "Oversized"
-                elif r_min >= min_goal and r_max <= max_goal: range_category = "Ideal"
-                else: range_category = "Mixed"
+                if range_label == "Under 25":
+                    r_min, r_max = 0, 24
+                elif range_label == "Over 175":
+                    r_min, r_max = 176, float("inf")
+                else:
+                    r_min, r_max = [int(v) for v in range_label.split("-")]
+
+                if r_max < min_goal:
+                    range_category = "Undersized"
+                elif r_min > max_goal:
+                    range_category = "Oversized"
+                elif r_min >= min_goal and r_max <= max_goal:
+                    range_category = "Ideal"
+                else:
+                    range_category = "Mixed"
             distribution.append([range_category, range_label, range_count])
 
-        pd.DataFrame(distribution, columns=["Category", "Range", "Count"]).to_excel(writer, sheet_name="Dashboard", startrow=11, index=False)
+        distribution_start = 13
+        pd.DataFrame(
+            distribution,
+            columns=["Category", "Range", "Count"],
+        ).to_excel(
+            writer,
+            sheet_name="Dashboard",
+            startrow=distribution_start - 1,
+            index=False,
+        )
 
         ws1 = writer.sheets["Dashboard"]
-        ws1.column_dimensions["A"].width = 18
-        ws1.column_dimensions["B"].width = 18
-        ws1.column_dimensions["C"].width = 18
+        for column_letter in ["A", "B", "C", "D", "E", "F", "G", "H"]:
+            ws1.column_dimensions[column_letter].width = 18
 
         ws1["A1"].font = Font(size=20, bold=True, color="0D6B31")
         ws1["A2"].hyperlink = None
         ws1["A2"].font = Font(size=10, italic=True, color="0D6B31")
+        ws1["A4"].font = Font(size=13, bold=True)
 
         bold_inline = InlineFont(b=True)
-        ws1["A10"].value = CellRichText([TextBlock(bold_inline, "Ideal Address Range"), f": ({min_goal}-{max_goal})"])
-        ws1["A11"].value = CellRichText(["About ", TextBlock(bold_inline, f"{ideal_pct:.1f}%"), " of territories fall within this range."])
+        ws1["A11"].value = CellRichText(
+            TextBlock(bold_inline, "Ideal Address Range"),
+            f": ({min_goal}-{max_goal})",
+        )
+        ws1["A11"].font = Font(size=13)
+        ws1["A12"].value = CellRichText(
+            "About ",
+            TextBlock(bold_inline, f"{ideal_pct:.1f}%"),
+            " of territories fall within this range.",
+        )
 
-        header_fill = PatternFill(start_color="C7CDDB", end_color="C7CDDB", fill_type="solid")
+        header_fill = PatternFill(
+            start_color="C7CDDB",
+            end_color="C7CDDB",
+            fill_type="solid",
+        )
         for col in range(1, 4):
-            ws1.cell(row=12, column=col).fill = header_fill
-            ws1.cell(row=12, column=col).font = Font(bold=True)
+            ws1.cell(row=distribution_start, column=col).fill = header_fill
+            ws1.cell(row=distribution_start, column=col).font = Font(bold=True)
 
-        distribution_end_row = 12 + len(distribution)
-        for row_number in range(13, distribution_end_row + 1):
+        distribution_end_row = distribution_start + len(distribution)
+        for row_number in range(distribution_start + 1, distribution_end_row + 1):
             if ws1.cell(row=row_number, column=1).value == "Ideal":
-                for col in range(1, 4): ws1.cell(row=row_number, column=col).font = Font(bold=True)
+                for col in range(1, 4):
+                    ws1.cell(row=row_number, column=col).font = Font(bold=True)
 
-        instruction_start = distribution_end_row + 2
-        volunteer_instructions = [
-            "The addresses in this analysis, with a little reformatting, can be added to NWS or other supported programs (Visit https://territorytoolbox.com for details)",
-            "It's suggested to export this file into a program you can easily edit, like excel or google sheets.",
-            "That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
+        features_start = distribution_end_row + 2
+        features_fill = PatternFill(
+            start_color="0D6B31",
+            end_color="0D6B31",
+            fill_type="solid",
+        )
+        ws1.merge_cells(
+            start_row=features_start,
+            start_column=1,
+            end_row=features_start,
+            end_column=8,
+        )
+        features_header = ws1.cell(
+            row=features_start,
+            column=1,
+            value="Features Of This Spreadsheet",
+        )
+        features_header.font = Font(bold=True, size=13, color="EFEFEF")
+        features_header.alignment = Alignment(
+            horizontal="left",
+            vertical="center",
+            wrap_text=True,
+        )
+        for col in range(1, 9):
+            ws1.cell(row=features_start, column=col).fill = features_fill
+
+        feature_instructions = [
+            "The DASHBOARD tab displays basic statistics about the territory that was analyzed. It also displays basic information on how the report is organized.",
+            "The COUNTS tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size (although that is a measured statistic). Through the counts tab, you gain insight into individual territories' density.",
+            "The ADDRESS LIST tab displays every workable address in your territory. This is what most of the engine's analysis is based off of! Any questionable entries are flagged with a data warning.",
+            "The APARTMENTS tab displays every multifamily at/above your apartment grouping threshold (defaulting @ 5 units = an apartment). Large apartment units can inflate territories sizes. These units can be turned into letter writing territory.",
+            "The TERRITORY BALANCING tab provides reduction, consolidation, and border-shift recommendations for \"balancing\" your territory density. It's a great launching off spot for remapping territory borders.",
+            "The EXCLUDED AUDIT tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. Addresses right outside your territory borders will be included here too. This is included for auditing purposes.",
+            "The addresses in this analysis, with a little reformatting, can be added to NWS or other supported programs (Visit https://territorytoolbox.com for details). It's suggested to export this file into a program you can easily edit, like excel or google sheets. That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
         ]
 
-        for offset, instruction in enumerate(volunteer_instructions):
-            row_number = instruction_start + offset
+        for offset, instruction in enumerate(feature_instructions, start=1):
+            row_number = features_start + offset
+            ws1.merge_cells(
+                start_row=row_number,
+                start_column=1,
+                end_row=row_number,
+                end_column=8,
+            )
             cell = ws1.cell(row=row_number, column=1, value=instruction)
+            cell.alignment = Alignment(
+                horizontal="left",
+                vertical="top",
+                wrap_text=True,
+            )
             if "https://territorytoolbox.com" in instruction:
                 cell.hyperlink = "https://territorytoolbox.com"
                 cell.font = Font(color="0563C1", underline="single")
 
-        features_start = instruction_start + len(volunteer_instructions) + 2
-        ws1.cell(row=features_start, column=1, value="Features Of This Spreadsheet").font = Font(bold=True, size=12)
-        for col in range(1, 4): ws1.cell(row=features_start, column=col).fill = header_fill
-
-        feature_instructions = [
-            CellRichText(["The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"]),
-            CellRichText(["The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."]),
-            CellRichText(["The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."]),
-            CellRichText(["The ", TextBlock(bold_inline, "APARTMENTS"), f" tab displays every multifamily at or above {apt_threshold} units in your territory. Large units can be explanations for inflated door-to-door territories."]),
-            CellRichText(["The ", TextBlock(bold_inline, "TERRITORY BALANCING"), " tab provides reduction, consolidation, and border-shift actions for balancing territories."]),
-            CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."]),
-        ]
-
-        for offset, instruction in enumerate(feature_instructions, start=1):
-            ws1.cell(row=features_start + offset, column=1, value=instruction)
-
         technical_start = features_start + len(feature_instructions) + 2
-        ws1.cell(row=technical_start, column=1, value="Technical: Run Information").font = Font(bold=True, size=12)
-        for col in range(1, 4): ws1.cell(row=technical_start, column=col).fill = header_fill
+        technical_fill = PatternFill(
+            start_color="C7CDDB",
+            end_color="C7CDDB",
+            fill_type="solid",
+        )
+        ws1.merge_cells(
+            start_row=technical_start,
+            start_column=1,
+            end_row=technical_start,
+            end_column=8,
+        )
+        technical_header = ws1.cell(
+            row=technical_start,
+            column=1,
+            value="Technical: Run Information",
+        )
+        technical_header.font = Font(bold=True, size=12)
+        for col in range(1, 9):
+            ws1.cell(row=technical_start, column=col).fill = technical_fill
 
         tech_info = [
             ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %H:%M")),
@@ -641,11 +720,14 @@ def generate_excel_report(
                 end_row=row_number,
                 end_column=2,
             )
+            ws1.merge_cells(
+                start_row=row_number,
+                start_column=3,
+                end_row=row_number,
+                end_column=8,
+            )
             label_cell = ws1.cell(row=row_number, column=1, value=label)
             value_cell = ws1.cell(row=row_number, column=3, value=value)
-
-            label_cell.font = Font(bold=False)
-            value_cell.font = Font(bold=False)
             label_cell.alignment = Alignment(
                 horizontal="left",
                 vertical="top",
@@ -654,21 +736,8 @@ def generate_excel_report(
             value_cell.alignment = Alignment(
                 horizontal="left",
                 vertical="top",
-                wrap_text=False,
+                wrap_text=True,
             )
-
-        for row in ws1.iter_rows(
-            min_col=2,
-            max_col=3,
-            min_row=1,
-            max_row=ws1.max_row,
-        ):
-            for cell in row:
-                cell.alignment = Alignment(
-                    horizontal="left",
-                    vertical=cell.alignment.vertical or "top",
-                    wrap_text=cell.alignment.wrap_text,
-                )
 
         ws1.delete_cols(17, 10)
 
@@ -688,10 +757,10 @@ def generate_excel_report(
             .dissolve(by="Territory_Name")
             .to_crs(metric_crs)
         )
-        territory_area_df["Size (Sq Miles)"] = (
-            territory_area_df.geometry.area / 2589988.11
+        territory_area_df["Size (Sq Acres)"] = (
+            territory_area_df.geometry.area * 0.000247105
         ).round(2)
-        territory_area_df = territory_area_df[["Size (Sq Miles)"]].reset_index()
+        territory_area_df = territory_area_df[["Size (Sq Acres)"]].reset_index()
 
         apartment_units_by_territory = (
             apt_groups.groupby("Territory_Name", observed=True)["Total Units"]
@@ -710,8 +779,8 @@ def generate_excel_report(
                 how="left",
             )
         )
-        counts_df_sorted["Size (Sq Miles)"] = (
-            counts_df_sorted["Size (Sq Miles)"].fillna(0).round(2)
+        counts_df_sorted["Size (Sq Acres)"] = (
+            counts_df_sorted["Size (Sq Acres)"].fillna(0).round(2)
         )
         counts_df_sorted["# of Apartment Units"] = (
             counts_df_sorted["# of Apartment Units"]
@@ -773,7 +842,7 @@ def generate_excel_report(
             )[
                 [
                     "Territory Name",
-                    "Size (Sq Miles)",
+                    "Size (Sq Acres)",
                     "Total Address Count",
                     "Current Status",
                     "Apartment Units",
@@ -1231,6 +1300,8 @@ def generate_excel_report(
         apt_groups["Suggested Action"] = apt_groups["_Action_Code"].map(
             apartment_action_text
         )
+        apt_groups["Excel Link"] = "Link"
+        apt_groups["Sheets Link"] = "Link"
 
         if not apt_groups.empty:
             apt_export = apt_groups.rename(
@@ -1247,6 +1318,8 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
+                    "Excel Link",
+                    "Sheets Link",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -1266,6 +1339,8 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
+                    "Excel Link",
+                    "Sheets Link",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -1297,18 +1372,20 @@ def generate_excel_report(
             "D": 18,
             "E": 18,
             "F": 107,
-            "G": 18,
-            "H": 18,
+            "G": 8.5,
+            "H": 8.5,
             "I": 18,
             "J": 18,
             "K": 18,
             "L": 18,
             "M": 18,
-            "N": 57,
+            "N": 18,
+            "O": 18,
+            "P": 57,
         }
         for column_letter, width in apartment_widths.items():
             ws4.column_dimensions[column_letter].width = width
-        for column_letter in ["G", "H", "I", "J", "K", "L", "M", "N"]:
+        for column_letter in ["I", "J", "K", "L", "M", "N", "O", "P"]:
             ws4.column_dimensions[column_letter].hidden = True
         ws4.delete_cols(15, 12)
 
@@ -1377,12 +1454,28 @@ def generate_excel_report(
 
             base_address = clean_field(ws4.cell(row=row_number, column=1).value)
             units_cell = ws4.cell(row=row_number, column=2)
+            units_cell.hyperlink = None
+            units_cell.font = Font(color="000000", underline=None)
+            if units_cell.value not in {None, ""}:
+                units_cell.value = int(units_cell.value)
+
             address_list_row = address_row_lookup.get(base_address)
+            excel_link_cell = ws4.cell(row=row_number, column=7)
+            sheets_link_cell = ws4.cell(row=row_number, column=8)
             if address_list_row is not None:
-                units_value = int(units_cell.value)
-                units_cell.value = units_value
-                units_cell.hyperlink = f"#'Address List'!A{address_list_row}"
-                units_cell.font = Font(color="0563C1", underline="single")
+                excel_link_cell.value = (
+                    f"=HYPERLINK(\"#'Address List'!A{address_list_row}\",\"Link\")"
+                )
+                sheets_link_cell.value = (
+                    f"=HYPERLINK(\"#range='Address List'!A{address_list_row}\",\"Link\")"
+                )
+                for link_cell in [excel_link_cell, sheets_link_cell]:
+                    link_cell.font = Font(color="0563C1", underline="single")
+                    link_cell.alignment = Alignment(
+                        horizontal="center",
+                        vertical="center",
+                        wrap_text=False,
+                    )
 
             action_code = apt_groups.iloc[row_number - 2]["_Action_Code"]
             full_text = apartment_action_text[action_code]
@@ -2472,7 +2565,7 @@ if uploaded_kml != st.session_state["last_uploaded_kml"]:
         del st.session_state["excel_data"]
     st.session_state["last_uploaded_kml"] = uploaded_kml
 
-if uploaded_kml:
+if uploaded_kml and "excel_data" not in st.session_state:
     if st.button("Generate Territory Analysis"):
         status_placeholder = st.empty()
         status_placeholder.info("Analysis engine stops for coffee…")
@@ -2614,7 +2707,7 @@ if uploaded_kml:
 
 if "excel_data" in st.session_state:
     st.download_button(
-        label="⬇️ Download Excel Analysis",
+        label="Download Your Analysis File!",
         data=st.session_state["excel_data"],
         file_name=st.session_state["excel_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
