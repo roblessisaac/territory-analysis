@@ -13,7 +13,7 @@ import re
 import random
 from fractions import Fraction
 
-# Enable KML support in GeoPandas
+# Enable KML support in GeoPandas yippe!
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
 fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
 
