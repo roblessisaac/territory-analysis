@@ -57,8 +57,24 @@ st.markdown("Upload your territories KML map to generate a complete, filtered ad
 st.sidebar.header("Step 1: Configuration")
 congregation_name = st.sidebar.text_input("Congregation Name (No Spaces)", "ExampleCongregation")
 selected_county = st.sidebar.selectbox("Select County Data", list(COUNTY_CONFIGS.keys()))
-goal_range = st.sidebar.selectbox("Goal # of Addresses Per Territory", ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"])
-apartment_threshold = st.sidebar.selectbox("Apartment Grouping Threshold", [4, 5, 6], index=1)
+goal_range = st.sidebar.selectbox(
+    "Goal # of Addresses Per Territory",
+    ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
+    index=3,
+)
+
+with st.sidebar.expander("Advanced Settings"):
+    apartment_threshold = st.selectbox(
+        "Apartment Grouping Threshold",
+        [4, 5, 6],
+        index=1,
+    )
+    county_excluded_statuses = COUNTY_CONFIGS[selected_county]["excluded_statuses"]
+    selected_excluded_statuses = st.multiselect(
+        "Excluded Audit Controls",
+        options=county_excluded_statuses,
+        default=county_excluded_statuses,
+    )
 
 st.header("Step 2: Upload Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
@@ -359,6 +375,7 @@ def generate_excel_report(
     cong_name,
     county_config,
     apt_threshold,
+    selected_excluded_statuses,
     kml_filename,
     county_filename,
     duplicate_assignment_count,
@@ -368,7 +385,7 @@ def generate_excel_report(
     run_timestamp = datetime.datetime.now()
     state = county_config["state"]
     metric_crs = county_config["metric_crs"]
-    excluded_statuses = county_config["excluded_statuses"]
+    excluded_statuses = list(selected_excluded_statuses)
 
     joined_gdf = joined_gdf.copy()
     joined_gdf["Canonical_Zip_Code"] = joined_gdf["Canonical_Zip_Code"].map(normalize_zip_code)
@@ -493,7 +510,7 @@ def generate_excel_report(
         smallest_count = smallest_terr["Total_Addresses"] if smallest_terr is not None else 0
 
         dashboard_top = [
-            [f"TERRITORY ANALYSIS: {cong_name}".upper()],
+            ["TERRITORYTOOLBOX ANALYSIS ENGINE"],
             [f"Generated on {run_timestamp.strftime('%Y-%m-%d %H:%M')} by TerritoryToolbox (using the analysis tool)"],
             [""],
             [f"Total Territories: {total_territories}"],
@@ -600,6 +617,12 @@ def generate_excel_report(
             ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %H:%M")),
             ("Ideal Address Range Setting", f"{min_goal}-{max_goal} addresses"),
             ("Apartment Grouping Threshold", f"{apt_threshold} units"),
+            (
+                "Excluded Audit Controls",
+                ", ".join(selected_excluded_statuses)
+                if selected_excluded_statuses
+                else "None selected",
+            ),
             ("Address Records Loaded", len(joined_gdf)),
             ("Valid Addresses Assigned", len(valid_gdf)),
             ("Excluded Address Count", len(excluded_gdf)),
@@ -658,15 +681,37 @@ def generate_excel_report(
             worksheet.add_table(tab)
 
         # --- TAB 2: COUNTS ---
+        territory_area_df = (
+            kml_gdf[["Territory_Name", "geometry_terr"]]
+            .dropna(subset=["Territory_Name", "geometry_terr"])
+            .set_geometry("geometry_terr")
+            .dissolve(by="Territory_Name")
+            .to_crs(metric_crs)
+        )
+        territory_area_df["Size (Sq Miles)"] = (
+            territory_area_df.geometry.area / 2589988.11
+        ).round(2)
+        territory_area_df = territory_area_df[["Size (Sq Miles)"]].reset_index()
+
         apartment_units_by_territory = (
             apt_groups.groupby("Territory_Name", observed=True)["Total Units"]
             .sum()
             .reset_index(name="# of Apartment Units")
         )
-        counts_df_sorted = counts_df.merge(
-            apartment_units_by_territory,
-            on="Territory_Name",
-            how="left",
+        counts_df_sorted = (
+            counts_df.merge(
+                territory_area_df,
+                on="Territory_Name",
+                how="left",
+            )
+            .merge(
+                apartment_units_by_territory,
+                on="Territory_Name",
+                how="left",
+            )
+        )
+        counts_df_sorted["Size (Sq Miles)"] = (
+            counts_df_sorted["Size (Sq Miles)"].fillna(0).round(2)
         )
         counts_df_sorted["# of Apartment Units"] = (
             counts_df_sorted["# of Apartment Units"]
@@ -728,6 +773,7 @@ def generate_excel_report(
             )[
                 [
                     "Territory Name",
+                    "Size (Sq Miles)",
                     "Total Address Count",
                     "Current Status",
                     "Apartment Units",
@@ -749,11 +795,12 @@ def generate_excel_report(
         counts_widths = {
             "A": 14,
             "B": 14,
-            "C": 18,
-            "D": 14,
-            "E": 18,
+            "C": 14,
+            "D": 18,
+            "E": 14,
             "F": 18,
-            "G": 92,
+            "G": 18,
+            "H": 92,
         }
         for column_letter, width in counts_widths.items():
             ws2.column_dimensions[column_letter].width = width
@@ -813,14 +860,16 @@ def generate_excel_report(
             cell.border = bottom_border
 
         for row_number in range(2, len(counts_df_sorted) + 2):
-            current_status = ws2.cell(row=row_number, column=3).value
-            potential_status = ws2.cell(row=row_number, column=6).value
-            suggested_action = ws2.cell(row=row_number, column=7).value
+            current_status = ws2.cell(row=row_number, column=4).value
+            potential_status = ws2.cell(row=row_number, column=7).value
+            suggested_action = ws2.cell(row=row_number, column=8).value
 
             alternate_fill = (
                 white_fill if row_number % 2 == 0 else stripe_fill
             )
             ws2.cell(row=row_number, column=1).fill = alternate_fill
+            ws2.cell(row=row_number, column=2).fill = alternate_fill
+            ws2.cell(row=row_number, column=2).number_format = "0.00"
 
             current_is_ideal = current_status == "Ideal"
             potential_is_ideal = potential_status == "Ideal"
@@ -841,7 +890,7 @@ def generate_excel_report(
                 else red_potential_status_fill
             )
 
-            for column_number in [2, 4, 5]:
+            for column_number in [3, 5, 6]:
                 ws2.cell(
                     row=row_number,
                     column=column_number,
@@ -849,33 +898,33 @@ def generate_excel_report(
 
             ws2.cell(
                 row=row_number,
-                column=3,
+                column=4,
             ).fill = current_status_fill
             ws2.cell(
                 row=row_number,
-                column=6,
+                column=7,
             ).fill = potential_status_fill
             suggested_action_fill = (
                 green_data_fill if potential_is_ideal else red_data_fill
             )
             ws2.cell(
                 row=row_number,
-                column=7,
+                column=8,
             ).fill = suggested_action_fill
 
-            for column_number in range(1, 8):
+            for column_number in range(1, 9):
                 cell = ws2.cell(
                     row=row_number,
                     column=column_number,
                 )
                 cell.font = Font(
-                    bold=column_number == 2,
-                    italic=column_number in {4, 5, 6},
+                    bold=column_number == 3,
+                    italic=column_number in {5, 6, 7},
                     color="000000",
                 )
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {1, 7} else "center"
+                        "left" if column_number in {1, 8} else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
@@ -1333,7 +1382,7 @@ def generate_excel_report(
                 units_value = int(units_cell.value)
                 units_cell.value = units_value
                 units_cell.hyperlink = f"#'Address List'!A{address_list_row}"
-                units_cell.style = "Hyperlink"
+                units_cell.font = Font(color="0563C1", underline="single")
 
             action_code = apt_groups.iloc[row_number - 2]["_Action_Code"]
             full_text = apartment_action_text[action_code]
@@ -2128,13 +2177,35 @@ def generate_excel_report(
                 cell.border = balancing_border
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left"
-                        if column_number in {1, 3, 8, 9}
-                        else "center"
+                        "right"
+                        if column_number in {1, 3}
+                        else ("left" if column_number in {8, 9} else "center")
                     ),
                     vertical="center",
                     wrap_text=True,
                 )
+
+            black_side = Side(style="thin", color="000000")
+            ws5.cell(row=row_number, column=1).border = Border(
+                left=black_side,
+                top=black_side,
+                bottom=black_side,
+            )
+            ws5.cell(row=row_number, column=2).border = Border(
+                right=black_side,
+                top=black_side,
+                bottom=black_side,
+            )
+            ws5.cell(row=row_number, column=3).border = Border(
+                left=black_side,
+                top=black_side,
+                bottom=black_side,
+            )
+            ws5.cell(row=row_number, column=4).border = Border(
+                right=black_side,
+                top=black_side,
+                bottom=black_side,
+            )
 
             balancing_method_cell = ws5.cell(row=row_number, column=5)
             priority_cell = ws5.cell(row=row_number, column=6)
@@ -2199,17 +2270,34 @@ def generate_excel_report(
             audit_gdf["Unit_Sort"] = (
                 audit_gdf["Canonical_Unit"].map(clean_field).str.upper()
             )
-            audit_gdf = audit_gdf.sort_values(
-                by=[
-                    "Territory_Name",
-                    "Canonical_Street",
-                    "HouseNum_Sort",
-                    "HouseNum_Suffix_Rank",
-                    "HouseNum_Text_Sort",
-                    "Unit_Sort",
-                ],
-                kind="stable",
-            ).copy()
+            audit_territory_order = sorted(
+                audit_gdf["Territory_Name"].astype(str).unique(),
+                key=natural_keys,
+            )
+            audit_territory_rank = {
+                territory_name: rank
+                for rank, territory_name in enumerate(audit_territory_order)
+            }
+            audit_gdf["_Territory_Natural_Sort"] = (
+                audit_gdf["Territory_Name"]
+                .astype(str)
+                .map(audit_territory_rank)
+            )
+            audit_gdf = (
+                audit_gdf.sort_values(
+                    by=[
+                        "_Territory_Natural_Sort",
+                        "Canonical_Street",
+                        "HouseNum_Sort",
+                        "HouseNum_Suffix_Rank",
+                        "HouseNum_Text_Sort",
+                        "Unit_Sort",
+                    ],
+                    kind="stable",
+                )
+                .drop(columns=["_Territory_Natural_Sort"])
+                .copy()
+            )
 
             parsed_audit_df = audit_gdf.apply(
                 lambda row: parse_mailable_address(row, state),
@@ -2295,8 +2383,8 @@ def generate_excel_report(
         ws6.column_dimensions["U"].width = 38
 
         excluded_header_fill = PatternFill(
-            start_color="046A34",
-            end_color="046A34",
+            start_color="434343",
+            end_color="434343",
             fill_type="solid",
         )
         excluded_stripe_fill = PatternFill(
@@ -2499,6 +2587,7 @@ if uploaded_kml:
                     congregation_name.replace(" ", ""),
                     county_config,
                     apt_threshold=apartment_threshold,
+                    selected_excluded_statuses=selected_excluded_statuses,
                     kml_filename=uploaded_kml.name,
                     county_filename=county_config["file_path"],
                     duplicate_assignment_count=duplicate_assignment_count,
