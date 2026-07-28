@@ -350,7 +350,20 @@ def parse_mailable_address(row, state):
     )
 
 # --- 3. EXCEL GENERATION ENGINE ---
-def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, county_config, apt_threshold, kml_filename, county_filename, duplicate_assignment_count, unassigned_address_count):
+def generate_excel_report(
+    joined_gdf,
+    unassigned_gdf,
+    kml_gdf,
+    min_goal,
+    max_goal,
+    cong_name,
+    county_config,
+    apt_threshold,
+    kml_filename,
+    county_filename,
+    duplicate_assignment_count,
+    unassigned_address_count,
+):
     output = io.BytesIO()
     run_timestamp = datetime.datetime.now()
     state = county_config["state"]
@@ -708,18 +721,18 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     "Territory_Name": "Territory Name",
                     "Total_Addresses": "Total Address Count",
                     "Category": "Current Status",
-                    "Addresses With Apartments Removed": (
-                        "Total Address Count Without Apartments"
-                    ),
+                    "# of Apartment Units": "Apartment Units",
+                    "Addresses With Apartments Removed": "Total Count w/o Apts",
+                    "Potential Status": "Apartmentless Status",
                 }
             )[
                 [
                     "Territory Name",
                     "Total Address Count",
                     "Current Status",
-                    "# of Apartment Units",
-                    "Total Address Count Without Apartments",
-                    "Potential Status",
+                    "Apartment Units",
+                    "Total Count w/o Apts",
+                    "Apartmentless Status",
                     "Suggested Action",
                 ]
             ]
@@ -791,10 +804,10 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         for cell in ws2[1]:
             cell.fill = header_fill_counts
-            cell.font = Font(bold=True, color="EAECEB")
+            cell.font = Font(bold=True, color="EAECEB", size=12)
             cell.alignment = Alignment(
                 horizontal="center",
-                vertical="top",
+                vertical="center",
                 wrap_text=True,
             )
             cell.border = bottom_border
@@ -1011,10 +1024,10 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         for cell in ws3[1]:
             cell.fill = header_fill
-            cell.font = Font(bold=True, color="EAECEB")
+            cell.font = Font(bold=True, color="EAECEB", size=12)
             cell.alignment = Alignment(
                 horizontal="center",
-                vertical="top",
+                vertical="center",
                 wrap_text=True,
             )
 
@@ -1271,10 +1284,10 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
 
         for cell in ws4[1]:
             cell.fill = header_fill
-            cell.font = Font(bold=True, color="EAECEB")
+            cell.font = Font(bold=True, color="EAECEB", size=12)
             cell.alignment = Alignment(
                 horizontal="center",
-                vertical="top",
+                vertical="center",
                 wrap_text=True,
             )
 
@@ -1317,12 +1330,10 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             units_cell = ws4.cell(row=row_number, column=2)
             address_list_row = address_row_lookup.get(base_address)
             if address_list_row is not None:
-                units_value = units_cell.value
-                units_cell.value = (
-                    f'=HYPERLINK("#\'Address List\'!A{address_list_row}", '
-                    f'"{units_value}")'
-                )
-                units_cell.font = Font(color="0563C1", underline="single")
+                units_value = int(units_cell.value)
+                units_cell.value = units_value
+                units_cell.hyperlink = f"#'Address List'!A{address_list_row}"
+                units_cell.style = "Hyperlink"
 
             action_code = apt_groups.iloc[row_number - 2]["_Action_Code"]
             full_text = apartment_action_text[action_code]
@@ -2022,18 +2033,18 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         )
 
         ws5 = writer.sheets["Territory Balancing"]
-        ws5.freeze_panes = "D2"
+        ws5.freeze_panes = "E2"
 
         balancing_widths = {
-            "A": 14,
+            "A": 21,
             "B": 7,
             "C": 21,
             "D": 7,
-            "E": 14,
+            "E": 18,
             "F": 14,
             "G": 16,
             "H": 64,
-            "I": 92,
+            "I": 100,
         }
 
         for column_letter, width in balancing_widths.items():
@@ -2076,22 +2087,36 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             cell.font = Font(
                 bold=True,
                 color="EAECEB",
+                size=12,
             )
             cell.alignment = Alignment(
                 horizontal="center",
-                vertical="top",
+                vertical="center",
                 wrap_text=True,
             )
             cell.border = balancing_border
+
+        review_warning_fill = PatternFill(
+            start_color="C8A8A8",
+            end_color="C8A8A8",
+            fill_type="solid",
+        )
 
         for row_number in range(
             2,
             len(territory_balancing_df) + 2,
         ):
-            row_fill = (
+            ws5.row_dimensions[row_number].height = 26.25
+
+            left_fill = (
                 balancing_white_fill
                 if row_number % 2 == 0
                 else balancing_stripe_fill
+            )
+            right_fill = (
+                balancing_stripe_fill
+                if row_number % 2 == 0
+                else balancing_white_fill
             )
 
             for column_number in range(1, 10):
@@ -2099,7 +2124,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     row=row_number,
                     column=column_number,
                 )
-                cell.fill = row_fill
+                cell.fill = left_fill if column_number in {1, 2} else right_fill
                 cell.border = balancing_border
                 cell.alignment = Alignment(
                     horizontal=(
@@ -2111,17 +2136,15 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                     wrap_text=True,
                 )
 
-            balancing_method_cell = ws5.cell(
-                row=row_number,
-                column=5,
-            )
-            priority_cell = ws5.cell(
-                row=row_number,
-                column=6,
-            )
+            balancing_method_cell = ws5.cell(row=row_number, column=5)
+            priority_cell = ws5.cell(row=row_number, column=6)
+            affected_cell = ws5.cell(row=row_number, column=7)
 
             if balancing_method_cell.value == "Review Warning":
-                balancing_method_cell.fill = high_priority_fill
+                balancing_method_cell.fill = review_warning_fill
+                balancing_method_cell.font = Font(italic=True)
+                affected_cell.fill = review_warning_fill
+                affected_cell.font = Font(italic=True)
 
             if priority_cell.value == "High":
                 priority_cell.fill = high_priority_fill
@@ -2129,38 +2152,217 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
                 priority_cell.fill = medium_priority_fill
 
         # --- TAB 6: EXCLUDED AUDIT ---
-        if not excluded_gdf.empty:
-            excluded_gdf[["HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort"]] = excluded_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
-            excluded_gdf["Unit_Sort"] = excluded_gdf["Canonical_Unit"].map(clean_field).str.upper()
-            excluded_list_df = excluded_gdf.sort_values(by=["Territory_Name", "Canonical_Street", "HouseNum_Sort", "HouseNum_Suffix_Rank", "HouseNum_Text_Sort", "Unit_Sort"], kind="stable")
-            
-            export_ex_df = excluded_list_df[[
-                "Source_Record_ID", "Territory_Name", "NWS_Category", "NWS_Number", "Mailable_Address", "Canonical_Status", "Data_Quality_Flag",
-                "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"
-            ]].rename(columns={
-                "Source_Record_ID": "Source Record ID", "Territory_Name": "Territory Name", "Mailable_Address": "Mailable Address", 
-                "Canonical_Status": "Exclusion Reason", "Data_Quality_Flag": "Data Quality Flag",
-                "Canonical_HouseNo": "HouseNo", "Canonical_Street": "Street", "Canonical_Unit": "Unit", "Canonical_Zip_Code": "Zip_Code"
-            })
-            export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
-            ws6 = writer.sheets["Excluded Audit"]
-            add_excel_table(ws6, export_ex_df, "ExcludedAuditTable", show_stripes=True)
+        audit_frames = []
 
-            for column_letter in ["H", "I", "J", "K"]: ws6.column_dimensions[column_letter].hidden = True
-            ws6.column_dimensions["A"].width = 22
-            ws6.column_dimensions["B"].width = 18
-            ws6.column_dimensions["C"].width = 15
-            ws6.column_dimensions["D"].width = 15
-            ws6.column_dimensions["E"].width = 55
-            ws6.column_dimensions["F"].width = 25
-            ws6.column_dimensions["G"].width = 35
+        if not excluded_gdf.empty:
+            excluded_audit = excluded_gdf.copy()
+            excluded_audit["Exclusion Explanation"] = excluded_audit[
+                "Canonical_Status"
+            ].map(
+                lambda value: (
+                    "Excluded due to category: "
+                    f"{clean_field(value).upper()}"
+                )
+            )
+            audit_frames.append(excluded_audit)
+
+        if unassigned_gdf is not None and not unassigned_gdf.empty:
+            unassigned_audit = unassigned_gdf.copy()
+            unassigned_audit["Territory_Name"] = "Unassigned"
+            unassigned_audit["Exclusion Explanation"] = (
+                "Unassigned: Address falls outside of all drawn territory boundaries."
+            )
+            audit_frames.append(unassigned_audit)
+
+        if audit_frames:
+            audit_gdf = pd.concat(audit_frames, ignore_index=True, sort=False)
+            audit_gdf["Canonical_Zip_Code"] = audit_gdf[
+                "Canonical_Zip_Code"
+            ].map(normalize_zip_code)
+            audit_gdf[["Base_Address", "Mailable_Address"]] = audit_gdf.apply(
+                lambda row: build_addresses(row, state),
+                axis=1,
+            )
+            audit_gdf["Data_Quality_Flag"] = audit_gdf.apply(
+                evaluate_data_quality,
+                axis=1,
+            )
+            audit_gdf["Latitude"] = audit_gdf.geometry.y.astype(float)
+            audit_gdf["Longitude"] = audit_gdf.geometry.x.astype(float)
+            audit_gdf[
+                [
+                    "HouseNum_Sort",
+                    "HouseNum_Suffix_Rank",
+                    "HouseNum_Text_Sort",
+                ]
+            ] = audit_gdf["Canonical_HouseNo"].apply(house_number_sort_parts)
+            audit_gdf["Unit_Sort"] = (
+                audit_gdf["Canonical_Unit"].map(clean_field).str.upper()
+            )
+            audit_gdf = audit_gdf.sort_values(
+                by=[
+                    "Territory_Name",
+                    "Canonical_Street",
+                    "HouseNum_Sort",
+                    "HouseNum_Suffix_Rank",
+                    "HouseNum_Text_Sort",
+                    "Unit_Sort",
+                ],
+                kind="stable",
+            ).copy()
+
+            parsed_audit_df = audit_gdf.apply(
+                lambda row: parse_mailable_address(row, state),
+                axis=1,
+            )
+            audit_gdf = pd.concat([audit_gdf, parsed_audit_df], axis=1)
+
+            export_ex_df = audit_gdf[
+                [
+                    "Territory_Name",
+                    "Mailable_Address",
+                    "Exclusion Explanation",
+                    "FullHouNumber",
+                    "FullStreet",
+                    "Municipality",
+                    "State",
+                    "ZipCode",
+                    "ZIP4Code",
+                    "HouseNoPrefix",
+                    "HouseNoMain",
+                    "HouseSx",
+                    "StreetPrefixDir",
+                    "StreetName",
+                    "StreetType",
+                    "UnitType",
+                    "Unit",
+                    "Latitude",
+                    "Longitude",
+                    "Source_Record_ID",
+                    "Data_Quality_Flag",
+                ]
+            ].rename(
+                columns={
+                    "Territory_Name": "Territory Name",
+                    "Mailable_Address": "Mailable Address",
+                    "Source_Record_ID": "Source record ID",
+                    "Data_Quality_Flag": "Data Quality Flag",
+                }
+            )
         else:
-            empty_excluded_columns = ["Source Record ID", "Territory Name", "NWS_Category", "NWS_Number", "Mailable Address", "Exclusion Reason", "Data Quality Flag", "Canonical_HouseNo", "Canonical_Street", "Canonical_Unit", "Canonical_Zip_Code"]
-            pd.DataFrame(columns=empty_excluded_columns).to_excel(writer, sheet_name="Excluded Audit", index=False)
-            writer.sheets["Excluded Audit"].cell(row=2, column=1, value="No addresses were excluded in this map area.")
+            export_ex_df = pd.DataFrame(
+                columns=[
+                    "Territory Name",
+                    "Mailable Address",
+                    "Exclusion Explanation",
+                    "FullHouNumber",
+                    "FullStreet",
+                    "Municipality",
+                    "State",
+                    "ZipCode",
+                    "ZIP4Code",
+                    "HouseNoPrefix",
+                    "HouseNoMain",
+                    "HouseSx",
+                    "StreetPrefixDir",
+                    "StreetName",
+                    "StreetType",
+                    "UnitType",
+                    "Unit",
+                    "Latitude",
+                    "Longitude",
+                    "Source record ID",
+                    "Data Quality Flag",
+                ]
+            )
+
+        export_ex_df.to_excel(writer, sheet_name="Excluded Audit", index=False)
+        ws6 = writer.sheets["Excluded Audit"]
+        ws6.freeze_panes = "D2"
+
+        for column_letter in [
+            "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+            "N", "O", "P", "Q", "R", "S", "T",
+        ]:
+            ws6.column_dimensions[column_letter].hidden = True
+
+        ws6.column_dimensions["A"].width = 14
+        ws6.column_dimensions["B"].width = 57
+        ws6.column_dimensions["C"].width = 64
+        ws6.column_dimensions["R"].width = 25
+        ws6.column_dimensions["S"].width = 25
+        ws6.column_dimensions["T"].width = 36
+        ws6.column_dimensions["U"].width = 38
+
+        excluded_header_fill = PatternFill(
+            start_color="046A34",
+            end_color="046A34",
+            fill_type="solid",
+        )
+        excluded_stripe_fill = PatternFill(
+            start_color="F3F3F3",
+            end_color="F3F3F3",
+            fill_type="solid",
+        )
+        excluded_white_fill = PatternFill(
+            start_color="FFFFFF",
+            end_color="FFFFFF",
+            fill_type="solid",
+        )
+        excluded_border = Border(
+            left=Side(style="thin", color="999999"),
+            right=Side(style="thin", color="999999"),
+            top=Side(style="thin", color="999999"),
+            bottom=Side(style="thin", color="999999"),
+        )
+
+        for cell in ws6[1]:
+            cell.fill = excluded_header_fill
+            cell.font = Font(bold=True, color="EAECEB", size=12)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            cell.border = excluded_border
+
+        source_record_column_ex = export_ex_df.columns.get_loc(
+            "Source record ID"
+        ) + 1
+        latitude_column_ex = export_ex_df.columns.get_loc("Latitude") + 1
+        longitude_column_ex = export_ex_df.columns.get_loc("Longitude") + 1
+
+        for row_number in range(2, len(export_ex_df) + 2):
+            row_fill = (
+                excluded_white_fill
+                if row_number % 2 == 0
+                else excluded_stripe_fill
+            )
+            for column_number in range(1, len(export_ex_df.columns) + 1):
+                cell = ws6.cell(row=row_number, column=column_number)
+                cell.fill = row_fill
+                cell.border = excluded_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left"
+                        if column_number in {1, 2, 3, source_record_column_ex}
+                        else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=column_number in {1, 2, 3},
+                )
+
+            for coordinate_column in [latitude_column_ex, longitude_column_ex]:
+                coordinate_cell = ws6.cell(
+                    row=row_number,
+                    column=coordinate_column,
+                )
+                if coordinate_cell.value not in {None, ""}:
+                    coordinate_cell.value = float(coordinate_cell.value)
+                    coordinate_cell.number_format = "0.################"
 
         # --- EXCEL UX POLISH ---
-        writer.sheets["Territory Balancing"].freeze_panes = "D2"
+        writer.sheets["Territory Balancing"].freeze_panes = "E2"
         writer.sheets["Excluded Audit"].freeze_panes = "A2"
 
         writer.sheets["Dashboard"].sheet_properties.tabColor = "1E90FF"
@@ -2257,13 +2459,15 @@ if uploaded_kml:
                 joined_gdf = joined_gdf.dropna(
                     subset=["Territory_Name"]
                 ).copy()
-                assigned_source_count = joined_gdf[
-                    "Source_Record_ID"
-                ].nunique()
-                unassigned_address_count = max(
-                    len(parcel_join_gdf) - assigned_source_count,
-                    0,
+                assigned_source_ids = set(
+                    joined_gdf["Source_Record_ID"].dropna().astype(str)
                 )
+                unassigned_gdf = parcel_gdf[
+                    ~parcel_gdf["Source_Record_ID"].astype(str).isin(
+                        assigned_source_ids
+                    )
+                ].copy()
+                unassigned_address_count = len(unassigned_gdf)
 
                 joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
                 joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
@@ -2287,7 +2491,12 @@ if uploaded_kml:
                 ]))
 
                 excel_file = generate_excel_report(
-                    joined_gdf, kml_gdf, MIN_GOAL, MAX_GOAL, congregation_name.replace(" ", ""), 
+                    joined_gdf,
+                    unassigned_gdf,
+                    kml_gdf,
+                    MIN_GOAL,
+                    MAX_GOAL,
+                    congregation_name.replace(" ", ""),
                     county_config,
                     apt_threshold=apartment_threshold,
                     kml_filename=uploaded_kml.name,
