@@ -536,8 +536,8 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         ws1["A2"].font = Font(size=10, italic=True, color="0D6B31")
 
         bold_inline = InlineFont(b=True)
-        ws1["A10"].value = CellRichText([TextBlock(bold_inline, "Ideal Address Range"), f": ({min_goal}-{max_goal})"])
-        ws1["A11"].value = CellRichText(["About ", TextBlock(bold_inline, f"{ideal_pct:.1f}%"), " of territories fall within this range."])
+        ws1["A10"].value = CellRichText(TextBlock(bold_inline, "Ideal Address Range"), f": ({min_goal}-{max_goal})")
+        ws1["A11"].value = CellRichText("About ", TextBlock(bold_inline, f"{ideal_pct:.1f}%"), " of territories fall within this range.")
 
         header_fill = PatternFill(start_color="C7CDDB", end_color="C7CDDB", fill_type="solid")
         for col in range(1, 4):
@@ -568,12 +568,12 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
         for col in range(1, 4): ws1.cell(row=features_start, column=col).fill = header_fill
 
         feature_instructions = [
-            CellRichText(["The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"]),
-            CellRichText(["The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."]),
-            CellRichText(["The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."]),
-            CellRichText(["The ", TextBlock(bold_inline, "APARTMENTS"), f" tab displays every multifamily at or above {apt_threshold} units in your territory. Large units can be explanations for inflated door-to-door territories."]),
-            CellRichText(["The ", TextBlock(bold_inline, "TERRITORY BALANCING"), " tab provides reduction, consolidation, and border-shift actions for balancing territories."]),
-            CellRichText(["The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."]),
+            CellRichText("The ", TextBlock(bold_inline, "DASHBOARD"), " tab displays basic statistics about the territory that was analyzed"),
+            CellRichText("The ", TextBlock(bold_inline, "COUNTS"), " tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size."),
+            CellRichText("The ", TextBlock(bold_inline, "ADDRESS LIST"), " tab displays every workable address in your territory."),
+            CellRichText("The ", TextBlock(bold_inline, "APARTMENTS"), f" tab displays every multifamily at or above {apt_threshold} units in your territory. Large units can be explanations for inflated door-to-door territories."),
+            CellRichText("The ", TextBlock(bold_inline, "TERRITORY BALANCING"), " tab provides reduction, consolidation, and border-shift actions for balancing territories."),
+            CellRichText("The ", TextBlock(bold_inline, "EXCLUDED AUDIT"), " tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. This is included for confidence."),
         ]
 
         for offset, instruction in enumerate(feature_instructions, start=1):
@@ -1332,7 +1332,7 @@ def generate_excel_report(joined_gdf, kml_gdf, min_goal, max_goal, cong_name, co
             bold_phrase = apartment_bold_phrases[action_code]
             remainder = full_text[len(bold_phrase):]
             ws4.cell(row=row_number, column=6).value = CellRichText(
-                [TextBlock(InlineFont(b=True), bold_phrase), remainder]
+                TextBlock(InlineFont(b=True), bold_phrase), remainder
             )
 
         # --- TAB 5: TERRITORY BALANCING ---
