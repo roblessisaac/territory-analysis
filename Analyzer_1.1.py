@@ -12,6 +12,9 @@ import datetime
 import re
 import random
 from fractions import Fraction
+from itertools import combinations
+
+from shapely.geometry import box
 
 # Enable KML support in GeoPandas yippe!
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
@@ -24,8 +27,13 @@ COUNTY_CONFIGS = {
         "metric_crs": "EPSG:3071",
         "native_source_id": "TAXKEY",
         "excluded_statuses": [
-            "Undeveloped", "Parking Lot", "ROW", "Park or Recreational Facility",
-            "Undeveloped Outlot", "Sliver or Remnant", "Non Addressable Assoc with Adj Parcel",
+            "Undeveloped",
+            "Parking Lot",
+            "ROW",
+            "Park or Recreational Facility",
+            "Undeveloped Outlot",
+            "Sliver or Remnant",
+            "Non Addressable Assoc with Adj Parcel",
         ],
         "column_mapping": {
             "TAXKEY": "Canonical_Native_Source_ID",
@@ -39,7 +47,33 @@ COUNTY_CONFIGS = {
             "Unit": "Canonical_Unit",
             "Addr_Statu": "Canonical_Status",
         },
-    }
+    },
+    "Waukesha": {
+        "file_path": "zip://data/WAUKESHA_Shape_Address.zip",
+        "state": "WI",
+        "metric_crs": "EPSG:3071",
+        "native_source_id": "point_id",
+        "excluded_statuses": [
+            "Other",
+            "Utility Asset",
+            "Parcel",
+        ],
+        "column_mapping": {
+            "point_id": "Canonical_Native_Source_ID",
+            "site_numbe": "Canonical_HouseNo",
+            "addnum_suf": "Canonical_HouseSx",
+            "legprefixd": "Canonical_Dir",
+            "legroadnam": "Canonical_Street",
+            "legroadtyp": "Canonical_StType",
+            "legsuffixd": "Canonical_SuffixDir",
+            "post_comm": "Canonical_Muni",
+            "post_code": "Canonical_Zip_Code",
+            "unittype": "Canonical_UnitType",
+            "unitnumber": "Canonical_Unit",
+            "pointtype": "Canonical_Status",
+            "full_addre": "Canonical_Full_Address",
+        },
+    },
 }
 
 REQUIRED_CANONICAL_COLUMNS = [
@@ -48,60 +82,745 @@ REQUIRED_CANONICAL_COLUMNS = [
     "Canonical_Status", "geometry",
 ]
 
+CROSS_COUNTY_DUPLICATE_TOLERANCE_METERS = 5.0
+BOUNDARY_AUDIT_BUFFER_METERS = 45.0
+
+
+def clean_field(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    return text
+
+
+def natural_keys(text):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", str(text))
+    ]
+
+
+def assign_territory_names(kml_gdf):
+    kml_gdf = kml_gdf.copy()
+    fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
+
+    if "Name" in kml_gdf.columns:
+        names = kml_gdf["Name"]
+    elif "Description" in kml_gdf.columns:
+        names = kml_gdf["Description"]
+    else:
+        names = fallback_names
+
+    if isinstance(names, pd.Series):
+        names = names.replace(r"^\s*$", pd.NA, regex=True).fillna(
+            fallback_names
+        )
+
+    kml_gdf["Territory_Name"] = names.astype(str).str.strip()
+    return kml_gdf
+
+
+def detect_territory_group(territory_name):
+    name = clean_field(territory_name)
+    if not name:
+        return "Residential"
+
+    group_name = re.sub(
+        r"(?:[\s_-]+)?\d+[A-Za-z]?$",
+        "",
+        name,
+    ).strip(" -_")
+    group_name = re.sub(r"[\s_-]+", " ", group_name).strip()
+
+    if not group_name or group_name.lower() in {
+        "territory",
+        "imported",
+        "(imported)",
+    }:
+        return "Residential"
+    return group_name
+
+
+def apply_territory_groups(kml_gdf, group_overrides=None):
+    group_overrides = group_overrides or {}
+    kml_gdf = kml_gdf.copy()
+    kml_gdf["Detected_Territory_Group"] = kml_gdf[
+        "Territory_Name"
+    ].map(detect_territory_group)
+    kml_gdf["Territory_Group"] = kml_gdf[
+        "Detected_Territory_Group"
+    ].map(lambda group: clean_field(group_overrides.get(group, group)))
+    kml_gdf["Territory_Group"] = kml_gdf["Territory_Group"].replace(
+        "",
+        "Residential",
+    )
+    return kml_gdf
+
+
+def build_territory_order(kml_gdf):
+    territory_records = (
+        kml_gdf[["Territory_Name", "Territory_Group"]]
+        .dropna(subset=["Territory_Name"])
+        .drop_duplicates(subset=["Territory_Name"], keep="first")
+    )
+    records = territory_records.to_dict("records")
+    records.sort(
+        key=lambda record: (
+            natural_keys(record["Territory_Group"]),
+            natural_keys(record["Territory_Name"]),
+        )
+    )
+    territory_order = [record["Territory_Name"] for record in records]
+    territory_rank = {
+        territory_name: rank
+        for rank, territory_name in enumerate(territory_order)
+    }
+    return territory_order, territory_rank
+
+
+def territory_group_priority(territory_group):
+    """Return the cross-group assignment priority for a territory group."""
+    normalized_group = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        clean_field(territory_group).lower(),
+    )
+    if normalized_group.startswith("letterwriting"):
+        return 0
+    if normalized_group.startswith("residential"):
+        return 1
+    if normalized_group.startswith("business"):
+        return 2
+    return 3
+
+
+def normalize_county_prefix(county_name):
+    """Create a stable county prefix for globally unique source IDs."""
+    return re.sub(
+        r"[^A-Za-z0-9]+",
+        "_",
+        clean_field(county_name).upper(),
+    ).strip("_")
+
+
+def validate_selected_counties(selected_counties):
+    """Return the common state and metric CRS for compatible counties."""
+    if not selected_counties:
+        raise ValueError("Select at least one county before generating an analysis.")
+
+    states = {
+        clean_field(COUNTY_CONFIGS[county_name]["state"]).upper()
+        for county_name in selected_counties
+    }
+    metric_crs_values = {
+        clean_field(COUNTY_CONFIGS[county_name]["metric_crs"]).upper()
+        for county_name in selected_counties
+    }
+
+    if len(states) != 1:
+        raise ValueError(
+            "The selected counties do not share one state. Multi-state analyses "
+            "are not supported by this version."
+        )
+    if len(metric_crs_values) != 1:
+        raise ValueError(
+            "The selected counties do not share one compatible analysis CRS. "
+            "Choose counties configured with the same metric CRS."
+        )
+
+    return states.pop(), metric_crs_values.pop()
+
+
+@st.cache_data
+def inspect_kml_territory_groups(kml_bytes):
+    preview_gdf = gpd.read_file(io.BytesIO(kml_bytes), driver="KML")
+    preview_gdf = assign_territory_names(preview_gdf)
+    preview_gdf = apply_territory_groups(preview_gdf)
+    detected_groups = preview_gdf["Detected_Territory_Group"].unique().tolist()
+    detected_groups.sort(key=natural_keys)
+    return detected_groups, len(preview_gdf["Territory_Name"].unique())
+
+
+def resolve_overlapping_assignments(
+    joined_gdf,
+    kml_gdf,
+    metric_crs,
+    territory_rank,
+):
+    """Resolve all polygon matches to one final territory per source record.
+
+    Cross-group matches follow this priority: Letter Writing, Residential,
+    Business, then all other groups. If several territories remain inside the
+    winning group, the address is assigned to the territory whose internal
+    representative point is nearest. Natural territory order breaks ties.
+    Every rejected match is retained in the Overlap Audit.
+    """
+    if joined_gdf.empty:
+        return joined_gdf.copy(), pd.DataFrame(), 0
+
+    matches = joined_gdf.reset_index(drop=True).copy()
+    matches["_Match_ID"] = matches.index
+    matches["_Territory_Rank"] = (
+        matches["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
+    matches["_Group_Priority"] = matches["Territory_Group"].map(
+        territory_group_priority
+    )
+    group_order = sorted(
+        matches["Territory_Group"].map(clean_field).unique(),
+        key=natural_keys,
+    )
+    group_rank = {
+        territory_group: rank
+        for rank, territory_group in enumerate(group_order)
+    }
+    matches["_Group_Rank"] = (
+        matches["Territory_Group"].map(group_rank).fillna(float("inf"))
+    )
+
+    territory_reference_gdf = (
+        kml_gdf[["Territory_Name", "geometry_terr"]]
+        .dropna(subset=["Territory_Name", "geometry_terr"])
+        .set_geometry("geometry_terr")
+        .dissolve(by="Territory_Name")
+        .to_crs(metric_crs)
+    )
+    territory_reference_gdf["_Reference_Point"] = (
+        territory_reference_gdf.geometry.representative_point()
+    )
+    reference_lookup = territory_reference_gdf[
+        "_Reference_Point"
+    ].to_dict()
+
+    match_points_metric = gpd.GeoDataFrame(
+        matches.copy(),
+        geometry="_join_point",
+        crs=joined_gdf.crs,
+    ).to_crs(metric_crs)
+    reference_points = gpd.GeoSeries(
+        matches["Territory_Name"].map(reference_lookup),
+        index=matches.index,
+        crs=metric_crs,
+    )
+    matches["_Assignment_Distance"] = (
+        match_points_metric.geometry.distance(reference_points, align=False)
+    ).fillna(float("inf"))
+
+    ordered_matches = matches.sort_values(
+        by=[
+            "Source_Record_ID",
+            "_Group_Priority",
+            "_Group_Rank",
+            "_Assignment_Distance",
+            "_Territory_Rank",
+            "_Match_ID",
+        ],
+        kind="stable",
+    )
+    selected_matches = ordered_matches.drop_duplicates(
+        subset=["Source_Record_ID"],
+        keep="first",
+    ).copy()
+
+    source_match_counts = matches.groupby("Source_Record_ID").size()
+    overlap_match_count = int(
+        (source_match_counts[source_match_counts > 1] - 1).sum()
+    )
+
+    additional_info = matches[
+        [
+            "Source_Record_ID",
+            "_Match_ID",
+            "Territory_Name",
+            "Territory_Group",
+            "_Group_Priority",
+        ]
+    ].rename(
+        columns={
+            "_Match_ID": "_Additional_Match_ID",
+            "Territory_Name": "Additional_Territory",
+            "Territory_Group": "Additional_Group",
+            "_Group_Priority": "_Additional_Group_Priority",
+        }
+    )
+    overlap_audit_df = selected_matches.merge(
+        additional_info,
+        on="Source_Record_ID",
+        how="inner",
+    )
+    overlap_audit_df = overlap_audit_df[
+        overlap_audit_df["_Match_ID"]
+        != overlap_audit_df["_Additional_Match_ID"]
+    ].copy()
+
+    if not overlap_audit_df.empty:
+        overlap_audit_df["Assigned_Territory"] = overlap_audit_df[
+            "Territory_Name"
+        ]
+        overlap_audit_df["Assigned_Group"] = overlap_audit_df[
+            "Territory_Group"
+        ]
+        same_group_mask = overlap_audit_df["Assigned_Group"].eq(
+            overlap_audit_df["Additional_Group"]
+        )
+        overlap_audit_df["Overlap_Type"] = (
+            "Cross-Group Priority Assignment"
+        )
+        overlap_audit_df.loc[
+            same_group_mask,
+            "Overlap_Type",
+        ] = "Same-Group Review"
+
+        resolution_values = []
+        resolution_fields = overlap_audit_df[
+            [
+                "Assigned_Territory",
+                "Additional_Territory",
+                "Assigned_Group",
+                "Additional_Group",
+                "_Group_Priority",
+                "_Additional_Group_Priority",
+            ]
+        ].itertuples(index=False, name=None)
+        for (
+            assigned_territory,
+            additional_territory,
+            assigned_group,
+            additional_group,
+            assigned_priority,
+            additional_priority,
+        ) in resolution_fields:
+            if assigned_group == additional_group:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory} using the nearest "
+                    "territory reference point; "
+                    f"{additional_territory} requires map review."
+                )
+            elif assigned_priority < additional_priority:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory}. "
+                    f"{additional_territory} was not counted because "
+                    f"{assigned_group} has higher assignment priority."
+                )
+            else:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory}. "
+                    f"{additional_territory} was not counted because the "
+                    "groups share the same fallback priority and "
+                    f"{assigned_group} won the natural group-order "
+                    "tie-breaker."
+                )
+        overlap_audit_df["Resolution"] = resolution_values
+
+    audit_helper_columns = [
+        "_Additional_Match_ID",
+        "_Additional_Group_Priority",
+    ]
+    overlap_audit_df = overlap_audit_df.drop(
+        columns=audit_helper_columns,
+        errors="ignore",
+    )
+
+    selected_helper_columns = [
+        "_Match_ID",
+        "_Territory_Rank",
+        "_Group_Priority",
+        "_Group_Rank",
+        "_Assignment_Distance",
+        "_join_point",
+        "index_right",
+    ]
+    selected_matches = selected_matches.drop(
+        columns=selected_helper_columns,
+        errors="ignore",
+    )
+    selected_matches = gpd.GeoDataFrame(
+        selected_matches,
+        geometry="geometry",
+        crs=joined_gdf.crs,
+    )
+    return selected_matches, overlap_audit_df, overlap_match_count
+
+
+def show_loading_status(placeholder, message=None):
+    """Display a loading wheel with messages rotating every five seconds."""
+    messages = [
+        "Analysis engine stops for coffee…",
+        "Analysis engine gets a new call…",
+        "Analysis engine makes a return visit…",
+        "Analysis engine stamps a letter…",
+    ]
+    if message in messages:
+        start_index = messages.index(message)
+        messages = messages[start_index:] + messages[:start_index]
+
+    message_spans = "".join(
+        f'<span class="territory-loading-message territory-loading-message-{i}">' 
+        f'{text}</span>'
+        for i, text in enumerate(messages)
+    )
+    placeholder.markdown(
+        f"""
+        <div class="territory-loading-row">
+            <span class="territory-loading-wheel"></span>
+            <span class="territory-loading-messages">{message_spans}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # --- 1. CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide")
 
-st.title("TerritoryToolbox's Analysis Engine")
-st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
+st.markdown(
+    """
+    <style>
+    .block-container {
+        width: 100%;
+        max-width: 980px;
+        margin-left: auto;
+        margin-right: auto;
+        padding-left: 3.5rem;
+        padding-right: 3.5rem;
+        padding-top: 2.5rem;
+    }
+    h1 {
+        text-align: center;
+    }
+    .territory-engine-intro {
+        text-align: center;
+        margin: 0 auto 2rem auto;
+        max-width: 760px;
+    }
+    @media (max-width: 768px) {
+        .block-container {
+            max-width: 100%;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            padding-top: 1.25rem;
+        }
+        h1 {
+            font-size: 2rem !important;
+            line-height: 1.15 !important;
+        }
+        .territory-engine-intro {
+            margin-bottom: 1.5rem;
+        }
+        .territory-loading-messages {
+            min-width: 0 !important;
+            width: 100%;
+        }
+        .territory-loading-message {
+            white-space: normal !important;
+        }
+    }
+    .territory-loading-row {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        background: rgba(128, 128, 128, 0.10);
+    }
+    .territory-loading-wheel {
+        width: 1rem;
+        height: 1rem;
+        border: 0.16rem solid rgba(90, 90, 90, 0.25);
+        border-top-color: rgb(90, 90, 90);
+        border-radius: 50%;
+        animation: territory-spin 0.8s linear infinite;
+        flex: 0 0 auto;
+    }
+    .territory-loading-messages {
+        position: relative;
+        display: inline-block;
+        min-height: 1.5rem;
+        min-width: 20rem;
+    }
+    .territory-loading-message {
+        position: absolute;
+        inset: 0 auto auto 0;
+        opacity: 0;
+        animation: territory-message-cycle 20s linear infinite;
+        white-space: nowrap;
+    }
+    .territory-loading-message-0 { animation-delay: 0s; }
+    .territory-loading-message-1 { animation-delay: 5s; }
+    .territory-loading-message-2 { animation-delay: 10s; }
+    .territory-loading-message-3 { animation-delay: 15s; }
+    .territory-guidance {
+        padding: 0.8rem 0.9rem;
+        border: 1px solid color-mix(in srgb, var(--text-color) 18%, transparent);
+        border-radius: 0.4rem;
+        background: var(--secondary-background-color);
+        color: var(--text-color);
+        font-size: 0.9rem;
+        line-height: 1.5;
+    }
+    .territory-guidance p {
+        margin: 0;
+    }
+    .territory-guidance p + p {
+        margin-top: 0.75rem;
+    }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"],
+    .stMultiSelect [data-baseweb="tag"],
+    div[data-baseweb="tag"] {
+        background-color: #6B7280 !important;
+        border-color: #6B7280 !important;
+        color: #FFFFFF !important;
+    }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] span,
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] svg,
+    .stMultiSelect [data-baseweb="tag"] span,
+    .stMultiSelect [data-baseweb="tag"] svg,
+    div[data-baseweb="tag"] span,
+    div[data-baseweb="tag"] svg {
+        color: #FFFFFF !important;
+        fill: #FFFFFF !important;
+    }
+    div[data-testid="stDownloadButton"] button {
+        background-color: #0D6B31 !important;
+        border-color: #0D6B31 !important;
+        color: white !important;
+    }
+    @keyframes territory-spin {
+        to { transform: rotate(360deg); }
+    }
+    @keyframes territory-message-cycle {
+        0%, 24.9% { opacity: 1; }
+        25%, 100% { opacity: 0; }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-st.sidebar.header("Step 1: Enter Your Analysis Details")
-congregation_name = st.sidebar.text_input("Congregation Name (No Spaces)", "ExampleCongregation")
-selected_county = st.sidebar.selectbox("Select County Data", list(COUNTY_CONFIGS.keys()))
-goal_range = st.sidebar.selectbox(
+st.title("TerritoryToolbox's Analysis Engine")
+st.markdown(
+    """
+    <div class="territory-engine-intro">
+        Upload your territories KML map to generate a complete, filtered
+        address database &amp; analysis.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.header("Step 1: Enter Your Analysis Details")
+congregation_name = st.text_input(
+    "Congregation Name (No Spaces)",
+    "ExampleCongregation",
+)
+county_options = list(COUNTY_CONFIGS.keys())
+selected_counties = st.multiselect(
+    "Counties Included In This Analysis",
+    options=county_options,
+    default=county_options[:1],
+)
+goal_range = st.selectbox(
     "Goal # of Addresses Per Territory",
     ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
     index=3,
 )
 
-with st.sidebar.expander("Advanced Settings"):
+selected_excluded_statuses = {}
+with st.expander("Advanced Settings"):
     apartment_threshold = st.selectbox(
         "Apartment Grouping Threshold",
         [4, 5, 6],
         index=1,
     )
-    county_excluded_statuses = COUNTY_CONFIGS[selected_county]["excluded_statuses"]
-    selected_excluded_statuses = st.multiselect(
-        f"{selected_county} Excluded Audit Controls",
-        options=county_excluded_statuses,
-        default=county_excluded_statuses,
-        key=f"excluded_audit_controls_{selected_county}",
-    )
+    for county_name in selected_counties:
+        county_excluded_statuses = COUNTY_CONFIGS[county_name][
+            "excluded_statuses"
+        ]
+        selected_excluded_statuses[county_name] = st.multiselect(
+            f"{county_name} Excluded Audit Controls",
+            options=county_excluded_statuses,
+            default=county_excluded_statuses,
+            key=f"excluded_audit_controls_{county_name}",
+        )
 
 st.header("Step 2: Upload Your Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
 
+territory_group_overrides = {}
+if uploaded_kml:
+    try:
+        detected_groups, detected_territory_count = (
+            inspect_kml_territory_groups(uploaded_kml.getvalue())
+        )
+        st.header("Step 3: Confirm Territory Groups")
+        st.caption(
+            f"Detected {detected_territory_count:,} unique territories."
+        )
+        st.markdown(
+            """
+            <div class="territory-guidance">
+                <p><strong>Tip:</strong> It’s best practice to analyze your territory
+                types (door-to-door/residential, business, letter-writing, etc.)
+                using separate KML files.</p>
+                <p>Combined files are supported, but if your maps overlap (ex:
+                business territories physically overlapping with house-to-house
+                territories), the engine will be forced to prioritize where shared
+                addresses are assigned.</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        group_label_to_internal = {
+            "Door-to-Door (Residential)": "Residential",
+            "Letter Writing": "Letter Writing",
+            "Business": "Business",
+            "Other": "Other",
+        }
+        group_options = list(group_label_to_internal.keys())
+        with st.expander("Review Detected Territory Groups", expanded=True):
+            for detected_group in detected_groups:
+                normalized_detected = clean_field(detected_group).lower()
+                if "letter" in normalized_detected:
+                    default_label = "Letter Writing"
+                elif "business" in normalized_detected:
+                    default_label = "Business"
+                elif "residential" in normalized_detected:
+                    default_label = "Door-to-Door (Residential)"
+                else:
+                    default_label = "Door-to-Door (Residential)"
+                selected_group_label = st.selectbox(
+                    f'Territories detected as "{detected_group}" should be considered:',
+                    options=group_options,
+                    index=group_options.index(default_label),
+                    key=(
+                        "territory_group_"
+                        + re.sub(
+                            r"[^A-Za-z0-9]+",
+                            "_",
+                            detected_group,
+                        ).strip("_")
+                    ),
+                )
+                territory_group_overrides[detected_group] = (
+                    group_label_to_internal[selected_group_label]
+                )
+    except Exception as error:
+        st.error(f"Unable to inspect territory groups: {error}")
+
 MIN_GOAL, MAX_GOAL = [int(x) for x in goal_range.split("-")]
+group_signature = tuple(sorted(territory_group_overrides.items()))
+county_signature = tuple(selected_counties)
+exclusion_signature = tuple(
+    (county_name, tuple(selected_excluded_statuses.get(county_name, [])))
+    for county_name in selected_counties
+)
 
 # --- 2. DATA LOADING & CACHING ---
-@st.cache_data
-def load_county_data(county_name):
+@st.cache_data(show_spinner=False)
+def load_county_data(county_name, kml_bounds=None, kml_crs=None):
+    """Load one county, using the KML extent as an early read filter."""
     county_config = COUNTY_CONFIGS[county_name]
-    try:
-        return gpd.read_file(county_config["file_path"])
-    except Exception as error:
-        st.error(f"Error loading county shapefile. Check the configured file path. Error: {error}")
-        return None
+    county_path = county_config["file_path"]
+    read_bbox = None
 
-def natural_keys(text):
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text))]
+    if kml_bounds and kml_crs:
+        try:
+            with fiona.open(county_path) as county_source:
+                source_crs = county_source.crs_wkt or county_source.crs
+            if source_crs:
+                kml_envelope = gpd.GeoSeries(
+                    [box(*kml_bounds)],
+                    crs=kml_crs,
+                ).to_crs(source_crs)
+                read_bbox = tuple(
+                    float(value) for value in kml_envelope.total_bounds
+                )
+        except (ValueError, TypeError, fiona.errors.FionaError):
+            read_bbox = None
+
+    if read_bbox is None:
+        return gpd.read_file(county_path)
+    return gpd.read_file(county_path, bbox=read_bbox)
+
+
+def prepare_county_data(
+    county_name,
+    kml_bounds,
+    kml_crs,
+    analysis_crs,
+):
+    """Normalize one county before it enters the combined address layer."""
+    county_config = COUNTY_CONFIGS[county_name]
+    county_gdf = load_county_data(
+        county_name,
+        kml_bounds=kml_bounds,
+        kml_crs=kml_crs,
+    )
+    county_gdf = county_gdf.reset_index(drop=True).copy()
+    county_gdf = county_gdf.rename(
+        columns=county_config["column_mapping"],
+        errors="ignore",
+    )
+
+    missing_columns = [
+        column
+        for column in REQUIRED_CANONICAL_COLUMNS
+        if column not in county_gdf.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"{county_name} County data failed preflight validation. Missing "
+            "required canonical columns: "
+            + ", ".join(missing_columns)
+        )
+    if county_gdf.crs is None:
+        raise ValueError(
+            f"{county_name} County data has no CRS. Assign the correct source "
+            "CRS before processing."
+        )
+
+    county_gdf["geometry"] = county_gdf.geometry.make_valid()
+    county_gdf = county_gdf[
+        county_gdf.geometry.notna() & ~county_gdf.geometry.is_empty
+    ].copy()
+    county_gdf["Source_County"] = county_name
+    county_gdf["Source_State"] = county_config["state"]
+
+    county_prefix = normalize_county_prefix(county_name)
+    fallback_ids = pd.Series(
+        [
+            f"FALLBACK-{row_number:09d}"
+            for row_number in range(1, len(county_gdf) + 1)
+        ],
+        index=county_gdf.index,
+        dtype="string",
+    )
+    native_id_col = "Canonical_Native_Source_ID"
+    if native_id_col in county_gdf.columns:
+        native_ids = county_gdf[native_id_col].map(clean_field)
+        source_ids = native_ids.where(native_ids.ne(""), fallback_ids)
+    else:
+        source_ids = fallback_ids
+
+    county_gdf["Source_Record_ID"] = (
+        county_prefix + "-" + source_ids.astype(str)
+    )
+    duplicate_ids = county_gdf["Source_Record_ID"].duplicated(keep=False)
+    if duplicate_ids.any():
+        duplicate_sequence = (
+            county_gdf.groupby("Source_Record_ID").cumcount() + 1
+        ).astype(str)
+        county_gdf.loc[duplicate_ids, "Source_Record_ID"] = (
+            county_gdf.loc[duplicate_ids, "Source_Record_ID"]
+            + "-DUP-"
+            + duplicate_sequence.loc[duplicate_ids]
+        )
+
+    return county_gdf.to_crs(analysis_crs)
 
 # --- ADDRESS BUILDER + NORMALIZATION HELPERS ---
-def clean_field(value):
-    if pd.isna(value): return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}: return ""
-    return text
-
 def normalize_house_number(value):
     text = clean_field(value)
     if not text: return ""
@@ -121,82 +840,330 @@ def normalize_zip_code(value):
     if len(digits) > 9: return f"{digits[:5]}-{digits[5:9]}"
     return digits
 
-def normalize_unit(value):
+def normalize_unit(value, unit_type=None):
     text = clean_field(value)
-    if not text: return ""
-    if re.fullmatch(r"\d+\.0+", text): text = text.split(".", 1)[0]
+    explicit_type = clean_field(unit_type)
+
+    if text and re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+
     text = re.sub(r"\s+", " ", text).strip()
-    descriptive_pattern = re.compile(r"^(?:apt(?:artment)?|unit|ste|suite|upper|lower|bsmt|basement|rear|front|floor|fl|building|bldg|room|rm)\b", flags=re.IGNORECASE)
-    if descriptive_pattern.search(text): return text
-    return f"Apt {text}"
+    explicit_type = re.sub(r"\s+", " ", explicit_type).strip()
+
+    if explicit_type:
+        if not text:
+            return explicit_type
+        if re.match(rf"^{re.escape(explicit_type)}\b", text, re.IGNORECASE):
+            return text
+        return f"{explicit_type} {text}"
+
+    if not text:
+        return ""
+
+    descriptive_pattern = re.compile(
+        r"^(?:apt(?:artment)?|unit|ste|suite|upper|lower|bsmt|basement|"
+        r"rear|front|floor|fl|building|bldg|room|rm)\b",
+        re.IGNORECASE,
+    )
+    return text if descriptive_pattern.search(text) else f"Apt {text}"
+
+
+def combine_house_number(row):
+    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    suffix = clean_field(row.get("Canonical_HouseSx"))
+
+    if not house or not suffix or house.upper().endswith(suffix.upper()):
+        return house
+
+    return f"{house}{suffix}"
+
+
+def build_canonical_street(row):
+    fields = [
+        row.get("Canonical_Dir"),
+        row.get("Canonical_Street"),
+        row.get("Canonical_StType"),
+        row.get("Canonical_SuffixDir"),
+    ]
+    return " ".join(clean_field(value) for value in fields if clean_field(value))
+
+
+def normalize_full_address(value):
+    text = clean_field(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s*,\s*", ", ", text).strip(" ,")
+
+
+def is_usable_full_address(value):
+    street_line = normalize_full_address(value).split(",", 1)[0].strip()
+    tokens = street_line.split()
+
+    if len(tokens) < 2:
+        return False
+
+    return bool(re.search(r"\d", tokens[0])) and bool(
+        re.search(r"[A-Za-z]", " ".join(tokens[1:]))
+    )
+
 
 def house_number_sort_parts(value):
     text = normalize_house_number(value).upper()
-    if not text: return pd.Series([float("inf"), 9, ""])
+    if not text:
+        return pd.Series([float("inf"), 9, ""])
+
     compact = re.sub(r"\s+", " ", text).strip()
-    mixed_fraction = re.match(r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$", compact)
+    grid_match = re.fullmatch(
+        r"([NSEW])(\d+)([NSEW])(\d+)([A-Z]?)",
+        compact,
+    )
+    if grid_match:
+        first_dir, first_num, second_dir, number, suffix = grid_match.groups()
+        text_sort = f"{first_dir}{int(first_num):06d}{second_dir}{suffix}"
+        return pd.Series([float(number), 3, text_sort])
+
+    mixed_fraction = re.match(
+        r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$",
+        compact,
+    )
     if mixed_fraction:
         whole, numerator, denominator, suffix = mixed_fraction.groups()
-        try: numeric_value = int(whole) + float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError): numeric_value = float(int(whole))
+        try:
+            numeric_value = int(whole) + float(
+                Fraction(int(numerator), int(denominator))
+            )
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float(int(whole))
         return pd.Series([numeric_value, 1, suffix.strip()])
+
     simple_fraction = re.match(r"^(\d+)\s*/\s*(\d+)(.*)$", compact)
     if simple_fraction:
         numerator, denominator, suffix = simple_fraction.groups()
-        try: numeric_value = float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError): numeric_value = float("inf")
+        try:
+            numeric_value = float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float("inf")
         return pd.Series([numeric_value, 1, suffix.strip()])
+
     numeric_prefix = re.match(r"^(\d+(?:\.\d+)?)(.*)$", compact)
     if numeric_prefix:
         number, suffix = numeric_prefix.groups()
-        return pd.Series([float(number), 0 if not suffix.strip() else 2, suffix.strip()])
+        suffix_rank = 0 if not suffix.strip() else 2
+        return pd.Series([float(number), suffix_rank, suffix.strip()])
+
     return pd.Series([float("inf"), 8, compact])
 
+
 def build_addresses(row, state):
-    house = normalize_house_number(row.get("Canonical_HouseNo"))
-    house_sx = clean_field(row.get("Canonical_HouseSx"))
-    direction = clean_field(row.get("Canonical_Dir"))
-    street = clean_field(row.get("Canonical_Street"))
-    st_type = clean_field(row.get("Canonical_StType"))
-    muni = clean_field(row.get("Canonical_Muni"))
+    full_house_number = combine_house_number(row)
+    full_street = build_canonical_street(row)
+    parsed_is_usable = bool(
+        full_house_number and clean_field(row.get("Canonical_Street"))
+    )
+
+    fallback = normalize_full_address(row.get("Canonical_Full_Address"))
+    fallback_line = fallback.split(",", 1)[0].strip()
+    if parsed_is_usable:
+        base_line = " ".join([full_house_number, full_street]).strip()
+    elif fallback_line:
+        base_line = fallback_line
+    else:
+        base_line = " ".join([full_house_number, full_street]).strip()
+
+    municipality = clean_field(row.get("Canonical_Muni"))
     normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
-    zip_c = normalized_zip[:5] if normalized_zip else ""
-    unit_str = normalize_unit(row.get("Canonical_Unit"))
+    zip_code = normalized_zip[:5] if normalized_zip else ""
+    locality = ", ".join(part for part in [municipality, state] if part)
+    if zip_code:
+        locality = f"{locality} {zip_code}".strip()
 
-    full_house_num = f"{house}{house_sx}".strip()
-    full_street = " ".join(part for part in [direction, street, st_type] if part)
-    base_addr_line = " ".join(part for part in [full_house_num, full_street] if part)
-    locality = ", ".join(part for part in [muni, state] if part)
-    if zip_c: locality = f"{locality} {zip_c}".strip()
+    unit = normalize_unit(
+        row.get("Canonical_Unit"),
+        row.get("Canonical_UnitType"),
+    )
+    mailable_line = " ".join(part for part in [base_line, unit] if part)
+    base_address = ", ".join(part for part in [base_line, locality] if part)
+    mailable_address = ", ".join(
+        part for part in [mailable_line, locality] if part
+    )
 
-    base_addr = ", ".join(part for part in [base_addr_line, locality] if part)
-    mailable_addr = ", ".join(part for part in [" ".join([base_addr_line, unit_str]).strip(), locality] if part)
+    return pd.Series(
+        [base_address, mailable_address],
+        index=["Base_Address", "Mailable_Address"],
+    )
 
-    return pd.Series([base_addr, mailable_addr], index=["Base_Address", "Mailable_Address"])
+
+def normalize_address_key(value):
+    """Normalize a complete address for cross-county duplicate review."""
+    text = clean_field(value).upper()
+    text = re.sub(r"[^A-Z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def find_cross_county_duplicates(combined_gdf, state, metric_crs):
+    """Flag close, same-address records supplied by different counties."""
+    empty_columns = [
+        "Mailable Address",
+        "Primary Source County",
+        "Primary Source Record ID",
+        "Additional Source County",
+        "Additional Source Record ID",
+        "Distance (Meters)",
+        "Review Status",
+    ]
+    combined_gdf = combined_gdf.copy()
+    combined_gdf["Cross_County_Duplicate_Flag"] = ""
+
+    if combined_gdf.empty or combined_gdf["Source_County"].nunique() < 2:
+        return combined_gdf, pd.DataFrame(columns=empty_columns)
+
+    duplicate_work = combined_gdf.copy()
+    duplicate_work[["Base_Address", "Mailable_Address"]] = (
+        duplicate_work.apply(
+            lambda row: build_addresses(row, state),
+            axis=1,
+        )
+    )
+    duplicate_work["_Address_Key"] = duplicate_work[
+        "Mailable_Address"
+    ].map(normalize_address_key)
+    duplicate_work = duplicate_work[
+        duplicate_work["_Address_Key"].ne("")
+    ].copy()
+    duplicate_work = duplicate_work.to_crs(metric_crs)
+
+    duplicate_rows = []
+    flagged_source_ids = set()
+    seen_pairs = set()
+    candidate_keys = duplicate_work.groupby("_Address_Key")[
+        "Source_County"
+    ].nunique()
+    candidate_keys = set(candidate_keys[candidate_keys > 1].index)
+
+    for _, address_group in duplicate_work[
+        duplicate_work["_Address_Key"].isin(candidate_keys)
+    ].groupby("_Address_Key", sort=False):
+        group_records = list(address_group.iterrows())
+        for (_, first_row), (_, second_row) in combinations(group_records, 2):
+            if first_row["Source_County"] == second_row["Source_County"]:
+                continue
+
+            pair_key = tuple(
+                sorted(
+                    [
+                        str(first_row["Source_Record_ID"]),
+                        str(second_row["Source_Record_ID"]),
+                    ]
+                )
+            )
+            if pair_key in seen_pairs:
+                continue
+
+            distance_meters = float(
+                first_row.geometry.distance(second_row.geometry)
+            )
+            if distance_meters > CROSS_COUNTY_DUPLICATE_TOLERANCE_METERS:
+                continue
+
+            seen_pairs.add(pair_key)
+            flagged_source_ids.update(pair_key)
+            primary_row, additional_row = sorted(
+                [first_row, second_row],
+                key=lambda row: (
+                    natural_keys(row["Source_County"]),
+                    str(row["Source_Record_ID"]),
+                ),
+            )
+            duplicate_rows.append(
+                {
+                    "Mailable Address": primary_row["Mailable_Address"],
+                    "Primary Source County": primary_row["Source_County"],
+                    "Primary Source Record ID": primary_row[
+                        "Source_Record_ID"
+                    ],
+                    "Additional Source County": additional_row[
+                        "Source_County"
+                    ],
+                    "Additional Source Record ID": additional_row[
+                        "Source_Record_ID"
+                    ],
+                    "Distance (Meters)": round(distance_meters, 2),
+                    "Review Status": (
+                        "Possible cross-county duplicate. Both records were "
+                        "retained for manual review."
+                    ),
+                }
+            )
+
+    if flagged_source_ids:
+        combined_gdf.loc[
+            combined_gdf["Source_Record_ID"].isin(flagged_source_ids),
+            "Cross_County_Duplicate_Flag",
+        ] = "Possible Cross-County Duplicate"
+
+    duplicate_audit_df = pd.DataFrame(
+        duplicate_rows,
+        columns=empty_columns,
+    )
+    if not duplicate_audit_df.empty:
+        duplicate_audit_df = duplicate_audit_df.sort_values(
+            by=[
+                "Mailable Address",
+                "Primary Source County",
+                "Additional Source County",
+                "Primary Source Record ID",
+            ],
+            kind="stable",
+        ).reset_index(drop=True)
+
+    return combined_gdf, duplicate_audit_df
+
+
+def append_quality_flag(base_flag, additional_flag):
+    """Combine quality messages without duplicating text."""
+    base_text = clean_field(base_flag)
+    additional_text = clean_field(additional_flag)
+    if not additional_text:
+        return base_text
+    if not base_text:
+        return additional_text
+    if additional_text in base_text.split(" | "):
+        return base_text
+    return f"{base_text} | {additional_text}"
+
 
 def evaluate_data_quality(row):
     issues = []
-    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    full_house_number = combine_house_number(row)
     street = clean_field(row.get("Canonical_Street"))
     municipality = clean_field(row.get("Canonical_Muni"))
     zip_code = normalize_zip_code(row.get("Canonical_Zip_Code"))
     base_address = clean_field(row.get("Base_Address"))
     mailable_address = clean_field(row.get("Mailable_Address"))
+    fallback = normalize_full_address(row.get("Canonical_Full_Address"))
 
-    if not street:
+    parsed_is_usable = bool(full_house_number and street)
+    fallback_is_usable = is_usable_full_address(fallback)
+
+    if not street and not fallback_is_usable:
         issues.append("Missing Street")
     if not municipality:
         issues.append("Missing Municipality")
     if not zip_code:
         issues.append("Missing ZIP")
-    if house and re.fullmatch(r"[+-]?0+(?:\.0+)?", house):
+    if full_house_number and re.fullmatch(
+        r"[+-]?0+(?:\.0+)?",
+        full_house_number,
+    ):
         issues.append("Zero House Number")
 
     zip_is_valid = not zip_code or bool(
         re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code)
     )
     if (
-        not house
+        not (parsed_is_usable or fallback_is_usable)
         or not base_address
         or not mailable_address
         or ",," in base_address
@@ -204,6 +1171,11 @@ def evaluate_data_quality(row):
         or not zip_is_valid
     ):
         issues.append("Malformed Address")
+
+    if not parsed_is_usable and fallback_is_usable:
+        issues.append("Full Address Fallback Used")
+    elif fallback and not parsed_is_usable:
+        issues.append("Unusable Full Address Fallback")
 
     return " | ".join(issues)
 
@@ -214,39 +1186,40 @@ def parse_house_number_components(full_house_number):
         return "", "", ""
 
     text = re.sub(r"\s+", " ", text).strip()
-    directional_prefix = ""
-    house_number_main = ""
-    house_suffix = ""
+    grid_match = re.fullmatch(
+        r"([NSEW]\d+[NSEW])(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
+        text,
+    )
+    if grid_match:
+        return grid_match.groups()
 
     directional_match = re.fullmatch(
         r"([NSEW])\s*(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
         text,
     )
     if directional_match:
-        directional_prefix, house_number_main, house_suffix = (
-            directional_match.groups()
-        )
-        return directional_prefix, house_number_main, house_suffix
+        return directional_match.groups()
 
     standard_match = re.fullmatch(
         r"(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
         text,
     )
     if standard_match:
-        house_number_main, house_suffix = standard_match.groups()
-        return "", house_number_main, house_suffix
+        house_main, suffix = standard_match.groups()
+        return "", house_main, suffix
 
-    numeric_match = re.search(r"\d+(?:\s+\d+/\d+|\.\d+)?", text)
-    if numeric_match:
-        house_number_main = numeric_match.group(0)
-        prefix_text = text[:numeric_match.start()].strip()
-        suffix_text = text[numeric_match.end():].strip()
-        if prefix_text in {"N", "S", "E", "W"}:
-            directional_prefix = prefix_text
-        if re.fullmatch(r"[A-Z]", suffix_text):
-            house_suffix = suffix_text
+    numeric_matches = list(
+        re.finditer(r"\d+(?:\s+\d+/\d+|\.\d+)?", text)
+    )
+    if not numeric_matches:
+        return "", "", ""
 
-    return directional_prefix, house_number_main, house_suffix
+    numeric_match = numeric_matches[-1]
+    prefix = text[:numeric_match.start()].strip()
+    suffix = text[numeric_match.end():].strip()
+    prefix = prefix if re.fullmatch(r"[NSEW](?:\d+[NSEW])?", prefix) else ""
+    suffix = suffix if re.fullmatch(r"[A-Z]", suffix) else ""
+    return prefix, numeric_match.group(0), suffix
 
 
 def parse_mailable_address(row, state):
@@ -264,31 +1237,29 @@ def parse_mailable_address(row, state):
     state_value = state
     normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
     zip_code = normalized_zip[:5] if normalized_zip else ""
-    zip4_code = (
-        normalized_zip.split("-", 1)[1]
-        if "-" in normalized_zip
-        else ""
-    )
+    zip4_code = normalized_zip.split("-", 1)[1] if "-" in normalized_zip else ""
     state_zip_match = re.fullmatch(
         r"([A-Za-z]{2})(?:\s+(\d{5})(?:-(\d{4}))?)?",
         state_zip,
     )
     if state_zip_match:
         state_value = state_zip_match.group(1).upper()
-        if state_zip_match.group(2):
-            zip_code = state_zip_match.group(2)
-        if state_zip_match.group(3):
-            zip4_code = state_zip_match.group(3)
+        zip_code = state_zip_match.group(2) or zip_code
+        zip4_code = state_zip_match.group(3) or zip4_code
 
     unit_type = ""
     unit_value = clean_field(row.get("Canonical_Unit"))
-    normalized_unit = normalize_unit(unit_value)
+    normalized_unit = normalize_unit(
+        unit_value,
+        row.get("Canonical_UnitType"),
+    )
     if normalized_unit:
         unit_match = re.match(
-            r"^(APT(?:ARTMENT)?|UNIT|STE|SUITE|UPPER|LOWER|BSMT|BASEMENT|"
-            r"REAR|FRONT|FLOOR|FL|BUILDING|BLDG|ROOM|RM)\b\s*(.*)$",
+            r"^(APT(?:ARTMENT)?|UNIT|STE|SUITE|UPPER|LOWER|BSMT|"
+            r"BASEMENT|REAR|FRONT|FLOOR|FL|BUILDING|BLDG|ROOM|RM|"
+            r"TRLR|TRAILER|LOT|PH|PENTHOUSE|OFFICE)\b\s*(.*)$",
             normalized_unit,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
         if unit_match:
             unit_type = unit_match.group(1).upper()
@@ -298,16 +1269,13 @@ def parse_mailable_address(row, state):
 
     street_without_unit = street_line
     if normalized_unit:
-        unit_suffix_pattern = re.compile(
+        unit_pattern = re.compile(
             rf"\s+{re.escape(normalized_unit)}$",
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
-        street_without_unit = unit_suffix_pattern.sub("", street_line).strip()
+        street_without_unit = unit_pattern.sub("", street_line).strip()
 
-    full_house_number = (
-        f"{normalize_house_number(row.get('Canonical_HouseNo'))}"
-        f"{clean_field(row.get('Canonical_HouseSx'))}"
-    ).strip()
+    full_house_number = combine_house_number(row)
     if not full_house_number:
         house_match = re.match(r"^(\S+)\s+(.*)$", street_without_unit)
         if house_match:
@@ -320,31 +1288,52 @@ def parse_mailable_address(row, state):
     street_prefix = clean_field(row.get("Canonical_Dir")).upper()
     street_name = clean_field(row.get("Canonical_Street"))
     street_type = clean_field(row.get("Canonical_StType")).upper()
+    suffix_direction = clean_field(
+        row.get("Canonical_SuffixDir")
+    ).upper()
     full_street = " ".join(
-        part for part in [street_prefix, street_name, street_type] if part
+        part
+        for part in [
+            street_prefix,
+            street_name,
+            street_type,
+            suffix_direction,
+        ]
+        if part
     )
 
-    if not full_street and street_without_unit:
+    if not street_name and street_without_unit:
         remaining_street = street_without_unit
         if full_house_number and remaining_street.upper().startswith(
             full_house_number.upper()
         ):
-            remaining_street = remaining_street[len(full_house_number):].strip()
+            remaining_street = remaining_street[
+                len(full_house_number):
+            ].strip()
 
         street_match = re.fullmatch(
             r"(?:(N|S|E|W|NE|NW|SE|SW)\s+)?(.+?)"
-            r"(?:\s+(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|"
-            r"LN|LANE|CT|COURT|PL|PLACE|PKWY|PARKWAY|HWY|HIGHWAY|WAY|TER|"
-            r"TERRACE|CIR|CIRCLE))?",
+            r"(?:\s+(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|"
+            r"DR|DRIVE|LN|LANE|CT|COURT|PL|PLACE|PKWY|PARKWAY|"
+            r"HWY|HIGHWAY|WAY|TER|TERRACE|CIR|CIRCLE))?"
+            r"(?:\s+(N|S|E|W|NE|NW|SE|SW))?",
             remaining_street,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
         if street_match:
             street_prefix = clean_field(street_match.group(1)).upper()
             street_name = clean_field(street_match.group(2))
             street_type = clean_field(street_match.group(3)).upper()
+            suffix_direction = clean_field(street_match.group(4)).upper()
             full_street = " ".join(
-                part for part in [street_prefix, street_name, street_type] if part
+                part
+                for part in [
+                    street_prefix,
+                    street_name,
+                    street_type,
+                    suffix_direction,
+                ]
+                if part
             )
 
     return pd.Series(
@@ -370,54 +1359,233 @@ def parse_mailable_address(row, state):
 def generate_excel_report(
     joined_gdf,
     unassigned_gdf,
+    overlap_audit_df,
+    cross_county_duplicate_df,
     kml_gdf,
     min_goal,
     max_goal,
     cong_name,
-    county_config,
+    analysis_config,
     apt_threshold,
     selected_excluded_statuses,
+    selected_counties,
+    county_source_files,
+    bounding_record_counts,
+    relevant_record_counts,
+    assigned_record_counts,
+    discarded_record_count,
     kml_filename,
-    county_filename,
-    duplicate_assignment_count,
+    overlap_match_count,
     unassigned_address_count,
 ):
     output = io.BytesIO()
     run_timestamp = datetime.datetime.now()
-    state = county_config["state"]
-    metric_crs = county_config["metric_crs"]
-    excluded_statuses = list(selected_excluded_statuses)
+    state = analysis_config["state"]
+    metric_crs = analysis_config["metric_crs"]
+    territory_order, territory_rank = build_territory_order(kml_gdf)
+    territory_group_lookup = (
+        kml_gdf[["Territory_Name", "Territory_Group"]]
+        .drop_duplicates(subset=["Territory_Name"], keep="first")
+        .set_index("Territory_Name")["Territory_Group"]
+        .to_dict()
+    )
 
     joined_gdf = joined_gdf.copy()
-    joined_gdf["Canonical_Zip_Code"] = joined_gdf["Canonical_Zip_Code"].map(normalize_zip_code)
-    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(lambda row: build_addresses(row, state), axis=1)
-    joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(evaluate_data_quality, axis=1)
-    flagged_record_count = joined_gdf["Data_Quality_Flag"].ne("").sum()
+    joined_gdf["Canonical_Zip_Code"] = joined_gdf[
+        "Canonical_Zip_Code"
+    ].map(normalize_zip_code)
+    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(
+        lambda row: build_addresses(row, state),
+        axis=1,
+    )
+    joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(
+        evaluate_data_quality,
+        axis=1,
+    )
+    if "Cross_County_Duplicate_Flag" in joined_gdf.columns:
+        joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(
+            lambda row: append_quality_flag(
+                row.get("Data_Quality_Flag"),
+                row.get("Cross_County_Duplicate_Flag"),
+            ),
+            axis=1,
+        )
+    flagged_record_count = int(
+        joined_gdf["Data_Quality_Flag"].ne("").sum()
+    )
 
-    normalized_excluded_statuses = {clean_field(status).upper() for status in excluded_statuses}
-    joined_gdf["Canonical_Status_Normalized"] = joined_gdf["Canonical_Status"].map(clean_field).str.upper()
-    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(normalized_excluded_statuses)
+    normalized_exclusions_by_county = {
+        county_name: {
+            clean_field(status).upper()
+            for status in selected_excluded_statuses.get(county_name, [])
+        }
+        for county_name in selected_counties
+    }
+    joined_gdf["Canonical_Status_Normalized"] = joined_gdf[
+        "Canonical_Status"
+    ].map(clean_field).str.upper()
+    exclusion_mask = pd.Series(False, index=joined_gdf.index)
+    for county_name, county_statuses in normalized_exclusions_by_county.items():
+        exclusion_mask |= (
+            joined_gdf["Source_County"].eq(county_name)
+            & joined_gdf["Canonical_Status_Normalized"].isin(
+                county_statuses
+            )
+        )
     excluded_gdf = joined_gdf[exclusion_mask].copy()
     valid_gdf = joined_gdf[~exclusion_mask].copy()
 
-    unique_territories = valid_gdf["Territory_Name"].unique().tolist()
-    unique_territories.sort(key=natural_keys)
-    valid_gdf["Territory_Name"] = pd.Categorical(valid_gdf["Territory_Name"], categories=unique_territories, ordered=True)
+    valid_gdf["_Territory_Order"] = (
+        valid_gdf["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
+    excluded_gdf["_Territory_Order"] = (
+        excluded_gdf["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
 
-    if not excluded_gdf.empty:
-        excluded_unique = excluded_gdf["Territory_Name"].unique().tolist()
-        excluded_unique.sort(key=natural_keys)
-        excluded_gdf["Territory_Name"] = pd.Categorical(excluded_gdf["Territory_Name"], categories=excluded_unique, ordered=True)
+    unique_physical_address_count = int(
+        valid_gdf["Source_Record_ID"].nunique()
+    )
+    territory_assignment_count = len(valid_gdf)
+    excluded_address_count = int(
+        excluded_gdf["Source_Record_ID"].nunique()
+    )
 
-    counts_df = valid_gdf.groupby("Territory_Name", observed=True).size().reset_index(name="Total_Addresses")
-    counts_df = counts_df[counts_df["Total_Addresses"] > 0].copy()
+    if overlap_audit_df is None or overlap_audit_df.empty:
+        valid_overlap_audit_df = pd.DataFrame()
+    else:
+        valid_overlap_audit_df = overlap_audit_df.copy()
+        valid_overlap_audit_df["Canonical_Status_Normalized"] = (
+            valid_overlap_audit_df["Canonical_Status"]
+            .map(clean_field)
+            .str.upper()
+        )
+        overlap_exclusion_mask = pd.Series(
+            False,
+            index=valid_overlap_audit_df.index,
+        )
+        for county_name, county_statuses in (
+            normalized_exclusions_by_county.items()
+        ):
+            overlap_exclusion_mask |= (
+                valid_overlap_audit_df["Source_County"].eq(county_name)
+                & valid_overlap_audit_df[
+                    "Canonical_Status_Normalized"
+                ].isin(county_statuses)
+            )
+        valid_overlap_audit_df = valid_overlap_audit_df[
+            ~overlap_exclusion_mask
+        ].copy()
+        valid_overlap_audit_df["Canonical_Zip_Code"] = (
+            valid_overlap_audit_df["Canonical_Zip_Code"].map(
+                normalize_zip_code
+            )
+        )
+        valid_overlap_audit_df[
+            ["Base_Address", "Mailable_Address"]
+        ] = valid_overlap_audit_df.apply(
+            lambda row: build_addresses(row, state),
+            axis=1,
+        )
+        valid_overlap_audit_df["Address"] = valid_overlap_audit_df[
+            "Mailable_Address"
+        ]
+
+    if valid_overlap_audit_df.empty:
+        cross_group_shared_address_count = 0
+        shared_across_groups_by_territory = {}
+        same_group_overlap_address_count = 0
+        same_group_overlaps_by_territory = {}
+    else:
+        cross_group_audit = valid_overlap_audit_df[
+            valid_overlap_audit_df["Overlap_Type"].eq(
+                "Cross-Group Priority Assignment"
+            )
+        ].copy()
+        cross_group_shared_address_count = int(
+            cross_group_audit["Source_Record_ID"].nunique()
+        )
+        cross_assigned = cross_group_audit[
+            ["Source_Record_ID", "Assigned_Territory"]
+        ].rename(columns={"Assigned_Territory": "Territory_Name"})
+        cross_additional = cross_group_audit[
+            ["Source_Record_ID", "Additional_Territory"]
+        ].rename(columns={"Additional_Territory": "Territory_Name"})
+        cross_group_involvement = pd.concat(
+            [cross_assigned, cross_additional],
+            ignore_index=True,
+        ).drop_duplicates()
+        shared_across_groups_by_territory = (
+            cross_group_involvement.groupby("Territory_Name")[
+                "Source_Record_ID"
+            ]
+            .nunique()
+            .to_dict()
+        )
+
+        same_group_audit = valid_overlap_audit_df[
+            valid_overlap_audit_df["Overlap_Type"].eq(
+                "Same-Group Review"
+            )
+        ].copy()
+        same_group_overlap_address_count = int(
+            same_group_audit["Source_Record_ID"].nunique()
+        )
+        same_assigned = same_group_audit[
+            ["Source_Record_ID", "Assigned_Territory"]
+        ].rename(columns={"Assigned_Territory": "Territory_Name"})
+        same_additional = same_group_audit[
+            ["Source_Record_ID", "Additional_Territory"]
+        ].rename(columns={"Additional_Territory": "Territory_Name"})
+        same_group_involvement = pd.concat(
+            [same_assigned, same_additional],
+            ignore_index=True,
+        ).drop_duplicates()
+        same_group_overlaps_by_territory = (
+            same_group_involvement.groupby("Territory_Name")[
+                "Source_Record_ID"
+            ]
+            .nunique()
+            .to_dict()
+        )
+
+    all_territories_df = pd.DataFrame(
+        {
+            "Territory_Name": territory_order,
+            "Territory_Group": [
+                territory_group_lookup.get(name, "Residential")
+                for name in territory_order
+            ],
+        }
+    )
+    valid_counts = (
+        valid_gdf.groupby("Territory_Name")
+        .size()
+        .reset_index(name="Total_Addresses")
+    )
+    counts_df = all_territories_df.merge(
+        valid_counts,
+        on="Territory_Name",
+        how="left",
+    )
+    counts_df["Total_Addresses"] = (
+        counts_df["Total_Addresses"].fillna(0).astype(int)
+    )
+    counts_df["_Territory_Order"] = counts_df["Territory_Name"].map(
+        territory_rank
+    )
 
     def get_category(count):
-        if count < min_goal: return "Undersized"
-        if count <= max_goal: return "Ideal"
+        if count == 0:
+            return "No Assigned Addresses"
+        if count < min_goal:
+            return "Undersized"
+        if count <= max_goal:
+            return "Ideal"
         return "Oversized"
 
-    counts_df["Category"] = counts_df["Total_Addresses"].apply(get_category)
+    counts_df["Category"] = counts_df["Total_Addresses"].apply(
+        get_category
+    )
 
     valid_gdf[["NWS_Category", "NWS_Number"]] = valid_gdf["Territory_Name"].astype(str).str.extract(r"^([A-Za-z]+)[-\s]+(.*)$")
     valid_gdf["NWS_Category"] = valid_gdf["NWS_Category"].fillna("UNK")
@@ -495,12 +1663,21 @@ def generate_excel_report(
     apt_groups = apt_groups[
         apt_groups["Total Units"] >= apt_threshold
     ].copy()
+    apt_groups["_Territory_Order"] = (
+        apt_groups["Territory_Name"]
+        .map(territory_rank)
+        .fillna(float("inf"))
+    )
+    apt_groups = apt_groups.sort_values(
+        by=["_Territory_Order", "Base_Address"],
+        kind="stable",
+    ).reset_index(drop=True)
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         
         # --- TAB 1: DASHBOARD ---
         total_territories = len(counts_df)
-        total_addresses = counts_df["Total_Addresses"].sum()
+        total_addresses = unique_physical_address_count
         largest_terr = counts_df.loc[counts_df["Total_Addresses"].idxmax()] if total_territories > 0 else None
         smallest_terr = counts_df.loc[counts_df["Total_Addresses"].idxmin()] if total_territories > 0 else None
         ideal_pct = (len(counts_df[counts_df["Category"] == "Ideal"]) / total_territories * 100) if total_territories > 0 else 0
@@ -517,7 +1694,7 @@ def generate_excel_report(
             ["Quick Facts:"],
             [f"Total Territories: {total_territories}"],
             [f"Total Valid Addresses: {total_addresses}"],
-            [f"Excluded Addresses (See Tab 6): {len(excluded_gdf)}"],
+            [f"Excluded Addresses (See Tab 6): {excluded_address_count}"],
             [f"The largest territory has {largest_count} addresses in it ({largest_name})."],
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
@@ -644,16 +1821,73 @@ def generate_excel_report(
             ws1.cell(row=features_start, column=col).fill = features_fill
 
         feature_instructions = [
-            "The DASHBOARD tab displays basic statistics about the territory that was analyzed. It also displays basic information on how the report is organized.",
-            "The COUNTS tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size (although that is a measured statistic). Through the counts tab, you gain insight into individual territories' density.",
-            "The ADDRESS LIST tab displays every workable address in your territory. This is what most of the engine's analysis is based off of! Any questionable entries are flagged with a data warning.",
-            "The APARTMENTS tab displays every multifamily at/above your apartment grouping threshold (defaulting @ 5 units = an apartment). Large apartment units can inflate territories sizes. These units can be turned into letter writing territory.",
-            "The TERRITORY BALANCING tab provides reduction, consolidation, and border-shift recommendations for \"balancing\" your territory density. It's a great launching off spot for remapping territory borders.",
-            "The EXCLUDED AUDIT tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. Addresses right outside your territory borders will be included here too. This is included for auditing purposes.",
-            "The addresses in this analysis, with a little reformatting, can be added to NWS or other supported programs (Visit https://territorytoolbox.com for details). It's suggested to export this file into a program you can easily edit, like excel or google sheets. That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
+            (
+                "DASHBOARD",
+                "The ",
+                " tab displays basic statistics about the territory that was "
+                "analyzed. It also displays basic information on how the report "
+                "is organized.",
+            ),
+            (
+                "COUNTS",
+                "The ",
+                " tab organizes territories by size. This is done by 'counting' "
+                "workable addresses, not geographical size (although that is a "
+                "measured statistic). Through the counts tab, you gain insight "
+                "into individual territories' density.",
+            ),
+            (
+                "ADDRESS LIST",
+                "The ",
+                " tab displays every workable address in your territory. This is "
+                "what most of the engine's analysis is based off of! Any "
+                "questionable entries are flagged with a data warning.",
+            ),
+            (
+                "APARTMENTS",
+                "The ",
+                " tab displays every multifamily at/above your apartment grouping "
+                "threshold (defaulting @ 5 units = an apartment). Large apartment "
+                "units can inflate territories sizes. These units can be turned "
+                "into letter writing territory.",
+            ),
+            (
+                "TERRITORY BALANCING",
+                "The ",
+                " tab provides reduction, consolidation, and border-shift "
+                "recommendations for \"balancing\" your territory density. It's a "
+                "great launching off spot for remapping territory borders.",
+            ),
+            (
+                "EXCLUDED AUDIT",
+                "The ",
+                " tab displays addresses that are NOT counted towards your "
+                "territory. These are usually addresses of highways, vacant lots, "
+                "parks, etc. Addresses right outside your territory borders will "
+                "be included here too. This is included for auditing purposes.",
+            ),
+            (
+                "OVERLAP AUDIT",
+                "The ",
+                " tab displays addresses that matched multiple territories. "
+                "Cross-group matches are assigned using the priority order "
+                "Letter Writing, Residential, Business, then Other. Conflicting "
+                "addresses within the same territory group are assigned once "
+                "and flagged for manual review.",
+            ),
+            (
+                "COUNTY DUPLICATE AUDIT",
+                "The ",
+                " tab flags same-address records supplied by different county "
+                "datasets within five meters of one another. These records are "
+                "retained and should be reviewed manually.",
+            ),
         ]
 
-        for offset, instruction in enumerate(feature_instructions, start=1):
+        for offset, (tab_name, prefix, suffix) in enumerate(
+            feature_instructions,
+            start=1,
+        ):
             row_number = features_start + offset
             ws1.merge_cells(
                 start_row=row_number,
@@ -661,17 +1895,48 @@ def generate_excel_report(
                 end_row=row_number,
                 end_column=8,
             )
-            cell = ws1.cell(row=row_number, column=1, value=instruction)
+            cell = ws1.cell(row=row_number, column=1)
+            cell.value = CellRichText(
+                prefix,
+                TextBlock(bold_inline, tab_name),
+                suffix,
+            )
             cell.alignment = Alignment(
                 horizontal="left",
                 vertical="top",
                 wrap_text=True,
             )
-            if "https://territorytoolbox.com" in instruction:
-                cell.hyperlink = "https://territorytoolbox.com"
-                cell.font = Font(color="0563C1", underline="single")
 
-        technical_start = features_start + len(feature_instructions) + 2
+        final_feature_row = features_start + len(feature_instructions) + 1
+        ws1.merge_cells(
+            start_row=final_feature_row,
+            start_column=1,
+            end_row=final_feature_row,
+            end_column=8,
+        )
+        final_feature_text = (
+            "The addresses in this analysis, with a little reformatting, can be "
+            "added to NWS or other supported programs (Visit "
+            "https://territorytoolbox.com for details). It's suggested to export "
+            "this file into a program you can easily edit, like excel or google "
+            "sheets. That will allow you to expand cells to read easier, create "
+            "custom filters to see specific data, and customize the sheet to make "
+            "it more legible."
+        )
+        final_feature_cell = ws1.cell(
+            row=final_feature_row,
+            column=1,
+            value=final_feature_text,
+        )
+        final_feature_cell.alignment = Alignment(
+            horizontal="left",
+            vertical="top",
+            wrap_text=True,
+        )
+        final_feature_cell.hyperlink = "https://territorytoolbox.com"
+        final_feature_cell.font = Font(color="0563C1", underline="single")
+
+        technical_start = final_feature_row + 2
         technical_fill = PatternFill(
             start_color="C7CDDB",
             end_color="C7CDDB",
@@ -692,24 +1957,84 @@ def generate_excel_report(
         for col in range(1, 9):
             ws1.cell(row=technical_start, column=col).fill = technical_fill
 
+        exclusion_summary = " | ".join(
+            f"{county_name}: "
+            + (
+                ", ".join(selected_excluded_statuses.get(county_name, []))
+                or "None selected"
+            )
+            for county_name in selected_counties
+        )
+        bounding_record_summary = " | ".join(
+            f"{county_name}: {bounding_record_counts.get(county_name, 0):,}"
+            for county_name in selected_counties
+        )
+        relevant_record_summary = " | ".join(
+            f"{county_name}: {relevant_record_counts.get(county_name, 0):,}"
+            for county_name in selected_counties
+        )
+        assigned_record_summary = " | ".join(
+            f"{county_name}: {assigned_record_counts.get(county_name, 0):,}"
+            for county_name in selected_counties
+        )
+        county_source_summary = " | ".join(
+            f"{county_name}: {county_source_files[county_name]}"
+            for county_name in selected_counties
+        )
+        possible_cross_county_duplicate_pairs = len(
+            cross_county_duplicate_df
+        )
+
         tech_info = [
             ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %H:%M")),
             ("Ideal Address Range Setting", f"{min_goal}-{max_goal} addresses"),
             ("Apartment Grouping Threshold", f"{apt_threshold} units"),
+            ("Counties Included", ", ".join(selected_counties)),
+            ("County Datasets Loaded", f"{len(selected_counties):,}"),
+            ("Records Inside KML Bounding Area", bounding_record_summary),
             (
-                "Excluded Audit Controls",
-                ", ".join(selected_excluded_statuses)
-                if selected_excluded_statuses
-                else "None selected",
+                "Records Near or Inside Territory Polygons",
+                relevant_record_summary,
             ),
-            ("Address Records Loaded", len(joined_gdf)),
-            ("Valid Addresses Assigned", len(valid_gdf)),
-            ("Excluded Address Count", len(excluded_gdf)),
-            ("Records Flagged with Warnings", flagged_record_count),
+            ("Assigned Records by County", assigned_record_summary),
+            (
+                "Records Discarded Outside Boundary Review Area",
+                f"{discarded_record_count:,}",
+            ),
+            ("Excluded Audit Controls", exclusion_summary),
+            (
+                "Address Records Assigned to Map",
+                f"{joined_gdf['Source_Record_ID'].nunique():,}",
+            ),
+            (
+                "Unique Physical Addresses",
+                f"{unique_physical_address_count:,}",
+            ),
+            (
+                "Territory Assignments Created",
+                f"{territory_assignment_count:,}",
+            ),
+            (
+                "Addresses Shared Across Groups",
+                f"{cross_group_shared_address_count:,}",
+            ),
+            (
+                "Same-Group Overlaps Needing Review",
+                f"{same_group_overlap_address_count:,}",
+            ),
+            ("Excluded Address Count", f"{excluded_address_count:,}"),
+            ("Records Flagged with Warnings", f"{flagged_record_count:,}"),
             ("KML Filename", kml_filename),
-            ("County Source Filename", county_filename),
-            ("Duplicate Boundary Assignments", duplicate_assignment_count),
-            ("Unassigned Address Records", unassigned_address_count),
+            ("County Source Files", county_source_summary),
+            (
+                "Possible Cross-County Duplicate Pairs",
+                f"{possible_cross_county_duplicate_pairs:,}",
+            ),
+            (
+                "Overlapping Address-to-Territory Matches",
+                f"{overlap_match_count:,}",
+            ),
+            ("Unassigned Address Records", f"{unassigned_address_count:,}"),
         ]
 
         for offset, (label, value) in enumerate(tech_info, start=1):
@@ -738,6 +2063,34 @@ def generate_excel_report(
                 vertical="top",
                 wrap_text=True,
             )
+
+        assignment_note_row = technical_start + len(tech_info) + 1
+        ws1.merge_cells(
+            start_row=assignment_note_row,
+            start_column=1,
+            end_row=assignment_note_row,
+            end_column=8,
+        )
+        assignment_note = ws1.cell(
+            row=assignment_note_row,
+            column=1,
+            value=(
+                f"The total territory assignment count is "
+                f"{territory_assignment_count:,}. Each physical address is "
+                "assigned to one final territory using this priority order: "
+                "Letter Writing, Residential, Business, then Other. When an "
+                "address matches multiple territories in the winning group, "
+                "it is assigned once using the nearest territory reference "
+                "point. All competing matches are documented in the Overlap "
+                "Audit."
+            ),
+        )
+        assignment_note.alignment = Alignment(
+            horizontal="left",
+            vertical="top",
+            wrap_text=True,
+        )
+        ws1.row_dimensions[assignment_note_row].height = 60
 
         ws1.delete_cols(17, 10)
 
@@ -820,20 +2173,78 @@ def generate_excel_report(
             ("Ideal", "Oversized"): "This is impossible.",
             ("Undersized", "Oversized"): "This is impossible.",
         }
-        counts_df_sorted["Suggested Action"] = counts_df_sorted.apply(
-            lambda row: suggested_actions.get(
-                (row["Category"], row["Potential Status"]),
+        def get_suggested_action(row):
+            if row["Category"] == "No Assigned Addresses":
+                return (
+                    "Review this territory. No valid addresses were assigned. "
+                    "It may overlap another territory, contain only excluded "
+                    "records, or contain no county address points."
+                )
+            potential_status = row["Potential Status"]
+            if potential_status == "No Assigned Addresses":
+                potential_status = "Undersized"
+            return suggested_actions.get(
+                (row["Category"], potential_status),
                 "Review territory manually",
-            ),
+            )
+
+        counts_df_sorted["Suggested Action"] = counts_df_sorted.apply(
+            get_suggested_action,
             axis=1,
         )
+        counts_df_sorted["Shared Across Groups"] = (
+            counts_df_sorted["Territory_Name"]
+            .map(shared_across_groups_by_territory)
+            .fillna(0)
+            .astype(int)
+        )
+        counts_df_sorted["Same-Group Overlaps"] = (
+            counts_df_sorted["Territory_Name"]
+            .map(same_group_overlaps_by_territory)
+            .fillna(0)
+            .astype(int)
+        )
 
+        def get_overlap_review(row):
+            same_group_count = int(row["Same-Group Overlaps"])
+            shared_count = int(row["Shared Across Groups"])
+            territory_count = int(row["Total_Addresses"])
+            high_overlap = same_group_count >= 10 or (
+                territory_count > 0
+                and same_group_count / territory_count >= 0.10
+            )
+
+            if same_group_count and shared_count:
+                if high_overlap:
+                    return (
+                        f"Review {same_group_count} same-group overlap(s); "
+                        f"{shared_count} cross-group priority assignment(s)"
+                    )
+                return (
+                    f"{same_group_count} same-group overlap(s) and "
+                    f"{shared_count} cross-group assignment(s)"
+                )
+            if same_group_count:
+                if high_overlap:
+                    return "High-overlap territory — review recommended"
+                return f"Review {same_group_count} same-group overlap(s)"
+            if shared_count:
+                return f"{shared_count} cross-group priority assignment(s)"
+            return "No overlap detected"
+
+        counts_df_sorted["Overlap Review"] = counts_df_sorted.apply(
+            get_overlap_review,
+            axis=1,
+        )
         counts_df_sorted = (
-            counts_df_sorted.sort_values(by="Territory_Name")
+            counts_df_sorted.sort_values(
+                by="_Territory_Order",
+                kind="stable",
+            )
             .rename(
                 columns={
                     "Territory_Name": "Territory Name",
-                    "Total_Addresses": "Total Address Count",
+                    "Total_Addresses": "Territory Address Count",
                     "Category": "Current Status",
                     "# of Apartment Units": "Apartment Units",
                     "Addresses With Apartments Removed": "Total Count w/o Apts",
@@ -843,12 +2254,15 @@ def generate_excel_report(
                 [
                     "Territory Name",
                     "Size (Sq Acres)",
-                    "Total Address Count",
+                    "Territory Address Count",
                     "Current Status",
                     "Apartment Units",
                     "Total Count w/o Apts",
                     "Apartmentless Status",
                     "Suggested Action",
+                    "Shared Across Groups",
+                    "Same-Group Overlaps",
+                    "Overlap Review",
                 ]
             ]
         )
@@ -864,12 +2278,15 @@ def generate_excel_report(
         counts_widths = {
             "A": 14,
             "B": 14,
-            "C": 14,
+            "C": 18,
             "D": 18,
             "E": 14,
             "F": 18,
             "G": 18,
             "H": 92,
+            "I": 18,
+            "J": 18,
+            "K": 38,
         }
         for column_letter, width in counts_widths.items():
             ws2.column_dimensions[column_letter].width = width
@@ -917,16 +2334,35 @@ def generate_excel_report(
         bottom_border = Border(
             bottom=Side(style="thin", color="666666")
         )
+        overlap_header_fill = PatternFill(
+            start_color="C7CDDB",
+            end_color="C7CDDB",
+            fill_type="solid",
+        )
+        overlap_warning_fill = PatternFill(
+            start_color="FFF2CC",
+            end_color="FFF2CC",
+            fill_type="solid",
+        )
+        overlap_left_side = Side(style="medium", color="666666")
 
-        for cell in ws2[1]:
-            cell.fill = header_fill_counts
-            cell.font = Font(bold=True, color="EAECEB", size=12)
+        for column_number, cell in enumerate(ws2[1], start=1):
+            if column_number >= 9:
+                cell.fill = overlap_header_fill
+                cell.font = Font(bold=True, color="000000", size=12)
+            else:
+                cell.fill = header_fill_counts
+                cell.font = Font(bold=True, color="EAECEB", size=12)
             cell.alignment = Alignment(
                 horizontal="center",
                 vertical="center",
                 wrap_text=True,
             )
             cell.border = bottom_border
+        ws2.cell(row=1, column=9).border = Border(
+            left=overlap_left_side,
+            bottom=Side(style="thin", color="666666"),
+        )
 
         for row_number in range(2, len(counts_df_sorted) + 2):
             current_status = ws2.cell(row=row_number, column=4).value
@@ -981,7 +2417,27 @@ def generate_excel_report(
                 column=8,
             ).fill = suggested_action_fill
 
-            for column_number in range(1, 9):
+            for column_number in range(9, 12):
+                ws2.cell(
+                    row=row_number,
+                    column=column_number,
+                ).fill = alternate_fill
+
+            same_group_overlap_value = ws2.cell(
+                row=row_number,
+                column=10,
+            ).value
+            if same_group_overlap_value not in {None, "", 0}:
+                ws2.cell(
+                    row=row_number,
+                    column=10,
+                ).fill = overlap_warning_fill
+                ws2.cell(
+                    row=row_number,
+                    column=11,
+                ).fill = overlap_warning_fill
+
+            for column_number in range(1, 12):
                 cell = ws2.cell(
                     row=row_number,
                     column=column_number,
@@ -993,16 +2449,24 @@ def generate_excel_report(
                 )
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {1, 8} else "center"
+                        "left"
+                        if column_number in {1, 8, 11}
+                        else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
                 )
                 cell.border = bottom_border
 
+            ws2.cell(row=row_number, column=9).border = Border(
+                left=overlap_left_side,
+                bottom=Side(style="thin", color="666666"),
+            )
+
         # --- TAB 3: ADDRESS LIST ---
-        valid_gdf["Latitude"] = valid_gdf.geometry.y.astype(float)
-        valid_gdf["Longitude"] = valid_gdf.geometry.x.astype(float)
+        valid_wgs84 = valid_gdf.to_crs("EPSG:4326")
+        valid_gdf["Latitude"] = valid_wgs84.geometry.y.astype(float)
+        valid_gdf["Longitude"] = valid_wgs84.geometry.x.astype(float)
         valid_gdf[
             [
                 "HouseNum_Sort",
@@ -1016,7 +2480,7 @@ def generate_excel_report(
 
         address_list_df = valid_gdf.sort_values(
             by=[
-                "Territory_Name",
+                "_Territory_Order",
                 "Canonical_Street",
                 "HouseNum_Sort",
                 "HouseNum_Suffix_Rank",
@@ -1055,6 +2519,7 @@ def generate_excel_report(
                 "Unit",
                 "Latitude",
                 "Longitude",
+                "Source_County",
                 "Source_Record_ID",
                 "Data_Quality_Flag",
             ]
@@ -1062,6 +2527,7 @@ def generate_excel_report(
             columns={
                 "Territory_Name": "Territory Name",
                 "Mailable_Address": "Mailable Address",
+                "Source_County": "Source County",
                 "Source_Record_ID": "Source record ID",
                 "Data_Quality_Flag": "Data Quality Flag",
             }
@@ -1102,6 +2568,7 @@ def generate_excel_report(
             "Q",
             "R",
             "S",
+            "T",
         ]
         for column_letter in hidden_address_columns:
             ws3.column_dimensions[column_letter].hidden = True
@@ -1110,8 +2577,9 @@ def generate_excel_report(
         ws3.column_dimensions["B"].width = 57
         ws3.column_dimensions["Q"].width = 25
         ws3.column_dimensions["R"].width = 25
-        ws3.column_dimensions["S"].width = 36
-        ws3.column_dimensions["T"].width = 38
+        ws3.column_dimensions["S"].width = 18
+        ws3.column_dimensions["T"].width = 36
+        ws3.column_dimensions["U"].width = 38
 
         header_fill = PatternFill(
             start_color="046A34",
@@ -1256,7 +2724,10 @@ def generate_excel_report(
                 return "TEN_PLUS"
             if current_status == "Undersized":
                 return "CURRENT_UNDERSIZED"
-            if potential_status == "Undersized":
+            if potential_status in {
+                "Undersized",
+                "No Assigned Addresses",
+            }:
                 return "POTENTIAL_UNDERSIZED"
             if current_status == "Ideal" and potential_status == "Ideal":
                 return "IDEAL_TO_IDEAL"
@@ -1300,8 +2771,7 @@ def generate_excel_report(
         apt_groups["Suggested Action"] = apt_groups["_Action_Code"].map(
             apartment_action_text
         )
-        apt_groups["Excel Link"] = "Link"
-        apt_groups["Sheets Link"] = "Link"
+        apt_groups["Cell on Address List"] = ""
 
         if not apt_groups.empty:
             apt_export = apt_groups.rename(
@@ -1318,8 +2788,7 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
-                    "Excel Link",
-                    "Sheets Link",
+                    "Cell on Address List",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -1339,8 +2808,7 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
-                    "Excel Link",
-                    "Sheets Link",
+                    "Cell on Address List",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -1372,22 +2840,22 @@ def generate_excel_report(
             "D": 18,
             "E": 18,
             "F": 107,
-            "G": 8.5,
-            "H": 8.5,
+            "G": 14,
+            "H": 18,
             "I": 18,
             "J": 18,
             "K": 18,
             "L": 18,
             "M": 18,
             "N": 18,
-            "O": 18,
-            "P": 57,
+            "O": 57,
         }
         for column_letter, width in apartment_widths.items():
             ws4.column_dimensions[column_letter].width = width
-        for column_letter in ["I", "J", "K", "L", "M", "N", "O", "P"]:
+        for column_letter in ["H", "I", "J", "K", "L", "M", "N", "O"]:
             ws4.column_dimensions[column_letter].hidden = True
-        ws4.delete_cols(15, 12)
+        ws4.delete_cols(14, 12)
+        apartment_table.ref = f"A1:M{len(apt_export) + 1}"
 
         header_fill = PatternFill(
             start_color="046A34",
@@ -1446,7 +2914,7 @@ def generate_excel_report(
                 cell.border = apartment_bottom_border
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {1, 3, 6, 14} else "center"
+                        "left" if column_number in {1, 3, 6, 13} else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
@@ -1460,22 +2928,14 @@ def generate_excel_report(
                 units_cell.value = int(units_cell.value)
 
             address_list_row = address_row_lookup.get(base_address)
-            excel_link_cell = ws4.cell(row=row_number, column=7)
-            sheets_link_cell = ws4.cell(row=row_number, column=8)
+            address_cell_reference = ws4.cell(row=row_number, column=7)
             if address_list_row is not None:
-                excel_link_cell.value = (
-                    f"=HYPERLINK(\"#'Address List'!A{address_list_row}\",\"Link\")"
-                )
-                sheets_link_cell.value = (
-                    f"=HYPERLINK(\"#range='Address List'!A{address_list_row}\",\"Link\")"
-                )
-                for link_cell in [excel_link_cell, sheets_link_cell]:
-                    link_cell.font = Font(color="0563C1", underline="single")
-                    link_cell.alignment = Alignment(
-                        horizontal="center",
-                        vertical="center",
-                        wrap_text=False,
-                    )
+                address_cell_reference.value = f"A{address_list_row}"
+            address_cell_reference.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=False,
+            )
 
             action_code = apt_groups.iloc[row_number - 2]["_Action_Code"]
             full_text = apartment_action_text[action_code]
@@ -1801,7 +3261,10 @@ def generate_excel_report(
                     "Shift_Baseline_Count",
                 ] = potential_count
 
-            elif potential_status == "Undersized":
+            elif potential_status in {
+                "Undersized",
+                "No Assigned Addresses",
+            }:
                 balancing_rows.append(
                     {
                         "Territory": territory_name,
@@ -1863,7 +3326,7 @@ def generate_excel_report(
 
         for territory_name in sorted(
             unresolved_undersized,
-            key=natural_keys,
+            key=lambda name: territory_rank.get(name, float("inf")),
         ):
             if (
                 territory_name not in terr_geoms_metric.index
@@ -2119,18 +3582,11 @@ def generate_excel_report(
                     )
                 )
             )
-            originating_order = sorted(
-                territory_balancing_df["Territory"].astype(str).unique(),
-                key=natural_keys,
-            )
-            originating_rank = {
-                territory_name: rank
-                for rank, territory_name in enumerate(originating_order)
-            }
             territory_balancing_df["_Originating_Sort"] = (
                 territory_balancing_df["Territory"]
                 .astype(str)
-                .map(originating_rank)
+                .map(territory_rank)
+                .fillna(float("inf"))
             )
             territory_balancing_df = (
                 territory_balancing_df.sort_values(
@@ -2320,13 +3776,13 @@ def generate_excel_report(
 
         if not excluded_gdf.empty:
             excluded_audit = excluded_gdf.copy()
-            excluded_audit["Exclusion Explanation"] = excluded_audit[
-                "Canonical_Status"
-            ].map(
-                lambda value: (
-                    "Excluded due to category: "
-                    f"{clean_field(value).upper()}"
-                )
+            excluded_audit["Exclusion Explanation"] = excluded_audit.apply(
+                lambda row: (
+                    f"Excluded due to {clean_field(row.get('Source_County'))} "
+                    "category: "
+                    f"{clean_field(row.get('Canonical_Status')).upper()}"
+                ),
+                axis=1,
             )
             audit_frames.append(excluded_audit)
 
@@ -2334,7 +3790,9 @@ def generate_excel_report(
             unassigned_audit = unassigned_gdf.copy()
             unassigned_audit["Territory_Name"] = "Unassigned"
             unassigned_audit["Exclusion Explanation"] = (
-                "Unassigned: Address falls outside of all drawn territory boundaries."
+                "Unassigned: Address falls outside the drawn territory boundary "
+                f"but is within the {BOUNDARY_AUDIT_BUFFER_METERS:g}-meter "
+                "boundary audit area."
             )
             audit_frames.append(unassigned_audit)
 
@@ -2351,8 +3809,21 @@ def generate_excel_report(
                 evaluate_data_quality,
                 axis=1,
             )
-            audit_gdf["Latitude"] = audit_gdf.geometry.y.astype(float)
-            audit_gdf["Longitude"] = audit_gdf.geometry.x.astype(float)
+            if "Cross_County_Duplicate_Flag" in audit_gdf.columns:
+                audit_gdf["Data_Quality_Flag"] = audit_gdf.apply(
+                    lambda row: append_quality_flag(
+                        row.get("Data_Quality_Flag"),
+                        row.get("Cross_County_Duplicate_Flag"),
+                    ),
+                    axis=1,
+                )
+            audit_wgs84 = gpd.GeoDataFrame(
+                audit_gdf,
+                geometry="geometry",
+                crs=joined_gdf.crs,
+            ).to_crs("EPSG:4326")
+            audit_gdf["Latitude"] = audit_wgs84.geometry.y.astype(float)
+            audit_gdf["Longitude"] = audit_wgs84.geometry.x.astype(float)
             audit_gdf[
                 [
                     "HouseNum_Sort",
@@ -2363,18 +3834,11 @@ def generate_excel_report(
             audit_gdf["Unit_Sort"] = (
                 audit_gdf["Canonical_Unit"].map(clean_field).str.upper()
             )
-            audit_territory_order = sorted(
-                audit_gdf["Territory_Name"].astype(str).unique(),
-                key=natural_keys,
-            )
-            audit_territory_rank = {
-                territory_name: rank
-                for rank, territory_name in enumerate(audit_territory_order)
-            }
             audit_gdf["_Territory_Natural_Sort"] = (
                 audit_gdf["Territory_Name"]
                 .astype(str)
-                .map(audit_territory_rank)
+                .map(territory_rank)
+                .fillna(float("inf"))
             )
             audit_gdf = (
                 audit_gdf.sort_values(
@@ -2402,6 +3866,8 @@ def generate_excel_report(
                 [
                     "Territory_Name",
                     "Mailable_Address",
+                    "Source_County",
+                    "Canonical_Status",
                     "Exclusion Explanation",
                     "FullHouNumber",
                     "FullStreet",
@@ -2426,6 +3892,8 @@ def generate_excel_report(
                 columns={
                     "Territory_Name": "Territory Name",
                     "Mailable_Address": "Mailable Address",
+                    "Source_County": "Source County",
+                    "Canonical_Status": "County Status",
                     "Source_Record_ID": "Source record ID",
                     "Data_Quality_Flag": "Data Quality Flag",
                 }
@@ -2435,6 +3903,8 @@ def generate_excel_report(
                 columns=[
                     "Territory Name",
                     "Mailable Address",
+                    "Source County",
+                    "County Status",
                     "Exclusion Explanation",
                     "FullHouNumber",
                     "FullStreet",
@@ -2462,18 +3932,20 @@ def generate_excel_report(
         ws6.freeze_panes = "D2"
 
         for column_letter in [
-            "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
-            "N", "O", "P", "Q", "R", "S", "T",
+            "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+            "P", "Q", "R", "S", "T", "U", "V",
         ]:
             ws6.column_dimensions[column_letter].hidden = True
 
         ws6.column_dimensions["A"].width = 14
         ws6.column_dimensions["B"].width = 57
-        ws6.column_dimensions["C"].width = 64
-        ws6.column_dimensions["R"].width = 25
-        ws6.column_dimensions["S"].width = 25
-        ws6.column_dimensions["T"].width = 36
-        ws6.column_dimensions["U"].width = 38
+        ws6.column_dimensions["C"].width = 18
+        ws6.column_dimensions["D"].width = 22
+        ws6.column_dimensions["E"].width = 64
+        ws6.column_dimensions["T"].width = 25
+        ws6.column_dimensions["U"].width = 25
+        ws6.column_dimensions["V"].width = 36
+        ws6.column_dimensions["W"].width = 38
 
         excluded_header_fill = PatternFill(
             start_color="434343",
@@ -2526,11 +3998,11 @@ def generate_excel_report(
                 cell.alignment = Alignment(
                     horizontal=(
                         "left"
-                        if column_number in {1, 2, 3, source_record_column_ex}
+                        if column_number in {1, 2, 3, 4, 5, source_record_column_ex}
                         else "center"
                     ),
                     vertical="center",
-                    wrap_text=column_number in {1, 2, 3},
+                    wrap_text=column_number in {1, 2, 3, 4, 5},
                 )
 
             for coordinate_column in [latitude_column_ex, longitude_column_ex]:
@@ -2542,9 +4014,209 @@ def generate_excel_report(
                     coordinate_cell.value = float(coordinate_cell.value)
                     coordinate_cell.number_format = "0.################"
 
+        if export_ex_df.empty:
+            ws6["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws6["A2"].font = Font(italic=True, color="666666")
+
+        # --- TAB 7: OVERLAP AUDIT ---
+        overlap_columns = [
+            "Address",
+            "Assigned Territory",
+            "Additional Territory",
+            "Assigned Group",
+            "Additional Group",
+            "Source County",
+            "Overlap Type",
+            "Resolution",
+            "Source Record ID",
+        ]
+        if valid_overlap_audit_df.empty:
+            overlap_export_df = pd.DataFrame(columns=overlap_columns)
+        else:
+            overlap_export_df = valid_overlap_audit_df.copy()
+            overlap_export_df["_Assigned_Order"] = (
+                overlap_export_df["Assigned_Territory"]
+                .map(territory_rank)
+                .fillna(float("inf"))
+            )
+            overlap_export_df["_Additional_Order"] = (
+                overlap_export_df["Additional_Territory"]
+                .map(territory_rank)
+                .fillna(float("inf"))
+            )
+            overlap_export_df = (
+                overlap_export_df.sort_values(
+                    by=[
+                        "_Assigned_Order",
+                        "_Additional_Order",
+                        "Address",
+                        "Source_Record_ID",
+                        "Overlap_Type",
+                    ],
+                    kind="stable",
+                )
+                .rename(
+                    columns={
+                        "Assigned_Territory": "Assigned Territory",
+                        "Additional_Territory": "Additional Territory",
+                        "Assigned_Group": "Assigned Group",
+                        "Additional_Group": "Additional Group",
+                        "Source_County": "Source County",
+                        "Overlap_Type": "Overlap Type",
+                        "Source_Record_ID": "Source Record ID",
+                    }
+                )[overlap_columns]
+                .reset_index(drop=True)
+            )
+
+        overlap_export_df.to_excel(
+            writer,
+            sheet_name="Overlap Audit",
+            index=False,
+        )
+        ws7 = writer.sheets["Overlap Audit"]
+        ws7.freeze_panes = "A2"
+
+        overlap_widths = {
+            "A": 57,
+            "B": 22,
+            "C": 22,
+            "D": 18,
+            "E": 18,
+            "F": 18,
+            "G": 30,
+            "H": 90,
+            "I": 36,
+        }
+        for column_letter, width in overlap_widths.items():
+            ws7.column_dimensions[column_letter].width = width
+
+        for cell in ws7[1]:
+            cell.fill = excluded_header_fill
+            cell.font = Font(bold=True, color="EAECEB", size=12)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            cell.border = excluded_border
+
+        same_group_audit_fill = PatternFill(
+            start_color="FFF2CC",
+            end_color="FFF2CC",
+            fill_type="solid",
+        )
+        for row_number in range(2, len(overlap_export_df) + 2):
+            row_fill = (
+                excluded_white_fill
+                if row_number % 2 == 0
+                else excluded_stripe_fill
+            )
+            overlap_type = ws7.cell(row=row_number, column=7).value
+            if overlap_type == "Same-Group Review":
+                row_fill = same_group_audit_fill
+
+            for column_number in range(1, 10):
+                cell = ws7.cell(row=row_number, column=column_number)
+                cell.fill = row_fill
+                cell.border = excluded_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_number in {1, 2, 3, 7, 8, 9}
+                        else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=column_number in {1, 2, 3, 7, 8},
+                )
+
+        filter_end_row = max(len(overlap_export_df) + 1, 1)
+        ws7.auto_filter.ref = f"A1:I{filter_end_row}"
+        if overlap_export_df.empty:
+            ws7["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws7["A2"].font = Font(italic=True, color="666666")
+
+        # --- TAB 8: COUNTY DUPLICATE AUDIT ---
+        county_duplicate_columns = [
+            "Mailable Address",
+            "Primary Source County",
+            "Primary Source Record ID",
+            "Additional Source County",
+            "Additional Source Record ID",
+            "Distance (Meters)",
+            "Review Status",
+        ]
+        if cross_county_duplicate_df is None:
+            county_duplicate_export = pd.DataFrame(
+                columns=county_duplicate_columns
+            )
+        else:
+            county_duplicate_export = cross_county_duplicate_df.reindex(
+                columns=county_duplicate_columns
+            ).copy()
+
+        county_duplicate_export.to_excel(
+            writer,
+            sheet_name="County Duplicate Audit",
+            index=False,
+        )
+        ws8 = writer.sheets["County Duplicate Audit"]
+        ws8.freeze_panes = "A2"
+        county_duplicate_widths = {
+            "A": 57,
+            "B": 20,
+            "C": 38,
+            "D": 20,
+            "E": 38,
+            "F": 18,
+            "G": 72,
+        }
+        for column_letter, width in county_duplicate_widths.items():
+            ws8.column_dimensions[column_letter].width = width
+
+        for cell in ws8[1]:
+            cell.fill = excluded_header_fill
+            cell.font = Font(bold=True, color="EAECEB", size=12)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            cell.border = excluded_border
+
+        for row_number in range(2, len(county_duplicate_export) + 2):
+            row_fill = (
+                excluded_white_fill
+                if row_number % 2 == 0
+                else excluded_stripe_fill
+            )
+            for column_number in range(1, 8):
+                cell = ws8.cell(row=row_number, column=column_number)
+                cell.fill = row_fill
+                cell.border = excluded_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_number in {1, 2, 3, 4, 5, 7}
+                        else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=column_number in {1, 2, 3, 4, 5, 7},
+                )
+            ws8.cell(row=row_number, column=6).number_format = "0.00"
+
+        county_duplicate_filter_end = max(
+            len(county_duplicate_export) + 1,
+            1,
+        )
+        ws8.auto_filter.ref = f"A1:G{county_duplicate_filter_end}"
+        if county_duplicate_export.empty:
+            ws8["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws8["A2"].font = Font(italic=True, color="666666")
+
         # --- EXCEL UX POLISH ---
         writer.sheets["Territory Balancing"].freeze_panes = "E2"
         writer.sheets["Excluded Audit"].freeze_panes = "A2"
+        writer.sheets["Overlap Audit"].freeze_panes = "A2"
+        writer.sheets["County Duplicate Audit"].freeze_panes = "A2"
 
         writer.sheets["Dashboard"].sheet_properties.tabColor = "1E90FF"
         writer.sheets["Counts"].sheet_properties.tabColor = "32CD32"
@@ -2552,6 +4224,8 @@ def generate_excel_report(
         writer.sheets["Apartments"].sheet_properties.tabColor = "FF8C00"
         writer.sheets["Territory Balancing"].sheet_properties.tabColor = "FF0000"
         writer.sheets["Excluded Audit"].sheet_properties.tabColor = "808080"
+        writer.sheets["Overlap Audit"].sheet_properties.tabColor = "808080"
+        writer.sheets["County Duplicate Audit"].sheet_properties.tabColor = "808080"
 
     output.seek(0)
     return output
@@ -2559,156 +4233,287 @@ def generate_excel_report(
 # --- 4. EXECUTION FLOW ---
 if "last_uploaded_kml" not in st.session_state:
     st.session_state["last_uploaded_kml"] = None
+if "last_group_signature" not in st.session_state:
+    st.session_state["last_group_signature"] = None
+if "last_county_signature" not in st.session_state:
+    st.session_state["last_county_signature"] = None
+if "last_exclusion_signature" not in st.session_state:
+    st.session_state["last_exclusion_signature"] = None
+if "last_settings_signature" not in st.session_state:
+    st.session_state["last_settings_signature"] = None
 
-if uploaded_kml != st.session_state["last_uploaded_kml"]:
+settings_signature = (
+    congregation_name,
+    goal_range,
+    apartment_threshold,
+)
+
+inputs_changed = (
+    uploaded_kml != st.session_state["last_uploaded_kml"]
+    or group_signature != st.session_state["last_group_signature"]
+    or county_signature != st.session_state["last_county_signature"]
+    or exclusion_signature
+    != st.session_state["last_exclusion_signature"]
+    or settings_signature != st.session_state["last_settings_signature"]
+)
+if inputs_changed:
     if "excel_data" in st.session_state:
         del st.session_state["excel_data"]
     st.session_state["last_uploaded_kml"] = uploaded_kml
+    st.session_state["last_group_signature"] = group_signature
+    st.session_state["last_county_signature"] = county_signature
+    st.session_state["last_exclusion_signature"] = exclusion_signature
+    st.session_state["last_settings_signature"] = settings_signature
 
 if uploaded_kml and "excel_data" not in st.session_state:
     if st.button("Generate Territory Analysis"):
         status_placeholder = st.empty()
-        status_placeholder.info("Analysis engine stops for coffee…")
-        
-        parcel_gdf = load_county_data(selected_county)
+        show_loading_status(
+            status_placeholder,
+            "Analysis engine stops for coffee…",
+        )
 
-        if parcel_gdf is not None:
-            status_placeholder.info("Analysis engine gets a new call…")
-            
-            county_config = COUNTY_CONFIGS[selected_county]
-            parcel_gdf = parcel_gdf.reset_index(drop=True).copy()
-            parcel_gdf = parcel_gdf.rename(columns=county_config["column_mapping"], errors="ignore")
+        try:
+            analysis_state, analysis_crs = validate_selected_counties(
+                selected_counties
+            )
+            analysis_config = {
+                "state": analysis_state,
+                "metric_crs": analysis_crs,
+            }
 
-            missing_columns = [
-                column for column in REQUIRED_CANONICAL_COLUMNS if column not in parcel_gdf.columns
-            ]
-            if missing_columns:
-                status_placeholder.empty()
-                st.error("County data failed preflight validation. Missing required canonical columns: " + ", ".join(missing_columns))
-                st.stop()
-
-            native_id_col = "Canonical_Native_Source_ID"
-            county_id_prefix = re.sub(r"[^A-Za-z0-9]+", "_", selected_county.upper()).strip("_")
-            fallback_ids = pd.Series([f"{county_id_prefix}-FALLBACK-{row_number:09d}" for row_number in range(1, len(parcel_gdf) + 1)], index=parcel_gdf.index, dtype="string")
-            
-            if native_id_col in parcel_gdf.columns:
-                native_ids = parcel_gdf[native_id_col].map(clean_field)
-                parcel_gdf["Source_Record_ID"] = native_ids.where(native_ids.ne(""), fallback_ids)
-            else:
-                parcel_gdf["Source_Record_ID"] = fallback_ids
-
-            duplicate_native_ids = parcel_gdf["Source_Record_ID"].duplicated(keep=False)
-            if duplicate_native_ids.any():
-                duplicate_sequence = (parcel_gdf.groupby("Source_Record_ID").cumcount() + 1).astype(str)
-                parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] = parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] + "-DUP-" + duplicate_sequence.loc[duplicate_native_ids]
-
-            status_placeholder.info("Analysis engine makes a return visit…")
-
-            try:
-                kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
-                if kml_gdf.crs is None: kml_gdf = kml_gdf.set_crs("EPSG:4326", allow_override=True)
-                if parcel_gdf.crs is None: raise ValueError("The parcel dataset has no CRS. Assign the correct source CRS before processing.")
-
-                kml_gdf = kml_gdf.copy()
-                kml_gdf["geometry"] = kml_gdf.geometry.make_valid()
-                kml_gdf = kml_gdf[kml_gdf.geometry.notna() & ~kml_gdf.geometry.is_empty].copy()
-
-                fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
-                if "Name" in kml_gdf.columns: kml_gdf["Territory_Name"] = kml_gdf["Name"].replace(r"^\s*$", pd.NA, regex=True).fillna(fallback_names)
-                elif "Description" in kml_gdf.columns: kml_gdf["Territory_Name"] = kml_gdf["Description"].replace(r"^\s*$", pd.NA, regex=True).fillna(fallback_names)
-                else: kml_gdf["Territory_Name"] = fallback_names
-
-                if parcel_gdf.crs != kml_gdf.crs: parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
-
-                parcel_gdf = parcel_gdf.copy()
-                parcel_gdf["geometry"] = parcel_gdf.geometry.make_valid()
-                parcel_gdf = parcel_gdf[parcel_gdf.geometry.notna() & ~parcel_gdf.geometry.is_empty].copy()
-
-                territory_envelope = kml_gdf.geometry.union_all().envelope
-                parcel_gdf = parcel_gdf[parcel_gdf.geometry.intersects(territory_envelope)].copy()
-
-                parcel_gdf["_join_point"] = parcel_gdf.geometry.representative_point()
-                parcel_join_gdf = parcel_gdf.set_geometry("_join_point")
-                kml_gdf = kml_gdf.rename(columns={"geometry": "geometry_terr"}).set_geometry("geometry_terr")
-
-                joined_gdf = gpd.sjoin(
-                    parcel_join_gdf,
-                    kml_gdf[["Territory_Name", "geometry_terr"]],
-                    how="inner",
-                    predicate="covered_by",
+            kml_gdf = gpd.read_file(
+                io.BytesIO(uploaded_kml.getvalue()),
+                driver="KML",
+            )
+            if kml_gdf.crs is None:
+                kml_gdf = kml_gdf.set_crs(
+                    "EPSG:4326",
+                    allow_override=True,
                 )
-                joined_gdf = joined_gdf.dropna(
-                    subset=["Territory_Name"]
-                ).copy()
-                assigned_source_ids = set(
-                    joined_gdf["Source_Record_ID"].dropna().astype(str)
+            kml_gdf = kml_gdf.copy()
+            kml_gdf["geometry"] = kml_gdf.geometry.make_valid()
+            kml_gdf = kml_gdf[
+                kml_gdf.geometry.notna() & ~kml_gdf.geometry.is_empty
+            ].copy()
+            if kml_gdf.empty:
+                raise ValueError(
+                    "The uploaded KML contains no usable territory geometry."
                 )
-                unassigned_gdf = parcel_gdf[
-                    ~parcel_gdf["Source_Record_ID"].astype(str).isin(
-                        assigned_source_ids
-                    )
-                ].copy()
-                unassigned_address_count = len(unassigned_gdf)
+            kml_gdf = assign_territory_names(kml_gdf)
+            kml_gdf = apply_territory_groups(
+                kml_gdf,
+                territory_group_overrides,
+            )
 
-                joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
-                joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
-                status_placeholder.info("Analysis engine stamps a letter…")
+            kml_bounds = tuple(float(value) for value in kml_gdf.total_bounds)
+            kml_crs = str(kml_gdf.crs)
+            county_frames = []
+            county_record_counts = {}
+            county_source_files = {}
 
-                duplicate_assignment_count = joined_gdf.duplicated(subset=["Source_Record_ID"], keep="first").sum()
-                joined_gdf = joined_gdf.drop_duplicates(subset=["Source_Record_ID"], keep="first").copy()
-                
-                joined_gdf = joined_gdf.drop(columns=["_Territory_Sort"], errors="ignore")
-                joined_gdf = joined_gdf.set_geometry("geometry")
-                joined_gdf = joined_gdf.drop(columns=["_join_point", "index_right"], errors="ignore")
+            for county_name in selected_counties:
+                show_loading_status(status_placeholder)
+                county_gdf = prepare_county_data(
+                    county_name=county_name,
+                    kml_bounds=kml_bounds,
+                    kml_crs=kml_crs,
+                    analysis_crs=analysis_crs,
+                )
+                county_record_counts[county_name] = len(county_gdf)
+                county_source_files[county_name] = COUNTY_CONFIGS[
+                    county_name
+                ]["file_path"]
+                county_frames.append(county_gdf)
 
-                if duplicate_assignment_count > 0:
-                    st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
+            if not county_frames:
+                raise ValueError("No county datasets were selected or loaded.")
 
-                status_placeholder.info(random.choice([
-                    "Analysis engine stops for coffee…",
-                    "Analysis engine gets a new call…",
-                    "Analysis engine makes a return visit…",
-                    "Analysis engine stamps a letter…",
-                ]))
+            parcel_gdf = gpd.GeoDataFrame(
+                pd.concat(
+                    county_frames,
+                    ignore_index=True,
+                    sort=False,
+                ),
+                geometry="geometry",
+                crs=analysis_crs,
+            )
+            if parcel_gdf.empty:
+                raise ValueError(
+                    "No county address records intersect the uploaded KML "
+                    "extent."
+                )
 
-                excel_file = generate_excel_report(
+            kml_gdf = kml_gdf.to_crs(analysis_crs)
+            territory_union = gpd.GeoSeries(
+                [kml_gdf.geometry.union_all()],
+                crs=analysis_crs,
+            ).make_valid().iloc[0]
+            if territory_union.is_empty:
+                raise ValueError(
+                    "The uploaded KML contains no usable combined territory geometry."
+                )
+            territory_envelope = territory_union.envelope
+            parcel_gdf = parcel_gdf[
+                parcel_gdf.geometry.intersects(territory_envelope)
+            ].copy()
+            bounding_record_counts = {
+                county_name: int(
+                    parcel_gdf["Source_County"].eq(county_name).sum()
+                )
+                for county_name in selected_counties
+            }
+
+            # Compute representative points once, then retain only records inside
+            # the exact territory union or its small boundary-review buffer.
+            parcel_gdf["_join_point"] = (
+                parcel_gdf.geometry.representative_point()
+            )
+            territory_review_area = territory_union.buffer(
+                BOUNDARY_AUDIT_BUFFER_METERS
+            )
+            relevant_mask = parcel_gdf["_join_point"].covered_by(
+                territory_review_area
+            )
+            relevant_gdf = parcel_gdf[relevant_mask].copy()
+            discarded_record_count = int((~relevant_mask).sum())
+            relevant_record_counts = {
+                county_name: int(
+                    relevant_gdf["Source_County"].eq(county_name).sum()
+                )
+                for county_name in selected_counties
+            }
+
+            inside_mask = relevant_gdf["_join_point"].covered_by(
+                territory_union
+            )
+            assignment_candidates_gdf = relevant_gdf[inside_mask].copy()
+            unassigned_gdf = relevant_gdf[~inside_mask].copy()
+            unassigned_address_count = len(unassigned_gdf)
+
+            relevant_gdf, cross_county_duplicate_df = (
+                find_cross_county_duplicates(
+                    relevant_gdf,
+                    state=analysis_state,
+                    metric_crs=analysis_crs,
+                )
+            )
+            duplicate_flag_lookup = relevant_gdf.set_index(
+                "Source_Record_ID"
+            )["Cross_County_Duplicate_Flag"]
+            assignment_candidates_gdf["Cross_County_Duplicate_Flag"] = (
+                assignment_candidates_gdf["Source_Record_ID"]
+                .map(duplicate_flag_lookup)
+                .fillna("")
+            )
+            unassigned_gdf["Cross_County_Duplicate_Flag"] = (
+                unassigned_gdf["Source_Record_ID"]
+                .map(duplicate_flag_lookup)
+                .fillna("")
+            )
+
+            show_loading_status(status_placeholder)
+            parcel_join_gdf = assignment_candidates_gdf.set_geometry(
+                "_join_point"
+            )
+            kml_gdf = kml_gdf.rename(
+                columns={"geometry": "geometry_terr"}
+            ).set_geometry("geometry_terr")
+
+            joined_gdf = gpd.sjoin(
+                parcel_join_gdf,
+                kml_gdf[
+                    [
+                        "Territory_Name",
+                        "Territory_Group",
+                        "geometry_terr",
+                    ]
+                ],
+                how="inner",
+                predicate="covered_by",
+            )
+            joined_gdf = joined_gdf.dropna(
+                subset=["Territory_Name"]
+            ).copy()
+            assigned_record_counts = {
+                county_name: int(
+                    joined_gdf.loc[
+                        joined_gdf["Source_County"].eq(county_name),
+                        "Source_Record_ID",
+                    ].nunique()
+                )
+                for county_name in selected_counties
+            }
+
+            show_loading_status(status_placeholder)
+            _, territory_rank = build_territory_order(kml_gdf)
+            joined_gdf, overlap_audit_df, overlap_match_count = (
+                resolve_overlapping_assignments(
                     joined_gdf,
-                    unassigned_gdf,
                     kml_gdf,
-                    MIN_GOAL,
-                    MAX_GOAL,
-                    congregation_name.replace(" ", ""),
-                    county_config,
-                    apt_threshold=apartment_threshold,
-                    selected_excluded_statuses=selected_excluded_statuses,
-                    kml_filename=uploaded_kml.name,
-                    county_filename=county_config["file_path"],
-                    duplicate_assignment_count=duplicate_assignment_count,
-                    unassigned_address_count=unassigned_address_count,
+                    analysis_crs,
+                    territory_rank,
                 )
-                
-                safe_congregation_name = re.sub(
-                    r"[^A-Za-z0-9_-]+",
-                    "",
-                    congregation_name.replace(" ", ""),
-                ) or "Congregation"
-                filename = (
-                    f"{safe_congregation_name}-TerritoryAnalysis-"
-                    f"{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx"
-                )
-                st.session_state["excel_data"] = excel_file.getvalue()
-                st.session_state["excel_filename"] = filename
-                
-                status_placeholder.success("Analysis Complete! Download the generated file below")
+            )
 
-            except Exception as error:
-                status_placeholder.empty()
-                st.error(f"An error occurred during processing: {error}")
+            show_loading_status(status_placeholder)
+
+            excel_file = generate_excel_report(
+                joined_gdf,
+                unassigned_gdf,
+                overlap_audit_df,
+                cross_county_duplicate_df,
+                kml_gdf,
+                MIN_GOAL,
+                MAX_GOAL,
+                congregation_name.replace(" ", ""),
+                analysis_config,
+                apt_threshold=apartment_threshold,
+                selected_excluded_statuses=selected_excluded_statuses,
+                selected_counties=selected_counties,
+                county_source_files=county_source_files,
+                bounding_record_counts=bounding_record_counts,
+                relevant_record_counts=relevant_record_counts,
+                assigned_record_counts=assigned_record_counts,
+                discarded_record_count=discarded_record_count,
+                kml_filename=uploaded_kml.name,
+                overlap_match_count=overlap_match_count,
+                unassigned_address_count=unassigned_address_count,
+            )
+
+            safe_congregation_name = re.sub(
+                r"[^A-Za-z0-9_-]+",
+                "",
+                congregation_name.replace(" ", ""),
+            ) or "Congregation"
+            filename = (
+                f"{safe_congregation_name}-TerritoryAnalysis-"
+                f"{datetime.datetime.now().strftime('%Y-%m-%d')}.xlsx"
+            )
+            st.session_state["excel_data"] = excel_file.getvalue()
+            st.session_state["excel_filename"] = filename
+
+            status_placeholder.success(
+                "Analysis Complete! Download the generated file below"
+            )
+
+        except Exception as error:
+            status_placeholder.empty()
+            st.error(f"An error occurred during processing: {error}")
 
 if "excel_data" in st.session_state:
     st.download_button(
         label="Download Your Analysis File!",
         data=st.session_state["excel_data"],
         file_name=st.session_state["excel_filename"],
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime=(
+            "application/vnd.openxmlformats-officedocument."
+            "spreadsheetml.sheet"
+        ),
     )
+
+st.markdown(
+    "<div style='margin-top: 2rem;'><a href='https://territorytoolbox.com' "
+    "target='_blank' rel='noopener noreferrer'>Back to TerritoryToolbox</a></div>",
+    unsafe_allow_html=True,
+)
