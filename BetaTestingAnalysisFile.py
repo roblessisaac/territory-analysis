@@ -83,6 +83,7 @@ REQUIRED_CANONICAL_COLUMNS = [
 ]
 
 CROSS_COUNTY_DUPLICATE_TOLERANCE_METERS = 5.0
+BOUNDARY_AUDIT_BUFFER_METERS = 45.0
 
 
 def clean_field(value):
@@ -443,13 +444,28 @@ def resolve_overlapping_assignments(
     return selected_matches, overlap_audit_df, overlap_match_count
 
 
-def show_loading_status(placeholder, message):
-    """Display a processing message with a small animated loading wheel."""
+def show_loading_status(placeholder, message=None):
+    """Display a loading wheel with messages rotating every five seconds."""
+    messages = [
+        "Analysis engine stops for coffee…",
+        "Analysis engine gets a new call…",
+        "Analysis engine makes a return visit…",
+        "Analysis engine stamps a letter…",
+    ]
+    if message in messages:
+        start_index = messages.index(message)
+        messages = messages[start_index:] + messages[:start_index]
+
+    message_spans = "".join(
+        f'<span class="territory-loading-message territory-loading-message-{i}">' 
+        f'{text}</span>'
+        for i, text in enumerate(messages)
+    )
     placeholder.markdown(
         f"""
         <div class="territory-loading-row">
             <span class="territory-loading-wheel"></span>
-            <span>{message}</span>
+            <span class="territory-loading-messages">{message_spans}</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -468,19 +484,56 @@ st.markdown(
         gap: 0.65rem;
         padding: 0.75rem 1rem;
         border-radius: 0.5rem;
-        background: rgba(28, 131, 225, 0.1);
+        background: rgba(128, 128, 128, 0.10);
     }
     .territory-loading-wheel {
         width: 1rem;
         height: 1rem;
-        border: 0.16rem solid rgba(28, 131, 225, 0.25);
-        border-top-color: rgb(28, 131, 225);
+        border: 0.16rem solid rgba(90, 90, 90, 0.25);
+        border-top-color: rgb(90, 90, 90);
         border-radius: 50%;
         animation: territory-spin 0.8s linear infinite;
         flex: 0 0 auto;
     }
+    .territory-loading-messages {
+        position: relative;
+        display: inline-block;
+        min-height: 1.5rem;
+        min-width: 20rem;
+    }
+    .territory-loading-message {
+        position: absolute;
+        inset: 0 auto auto 0;
+        opacity: 0;
+        animation: territory-message-cycle 20s linear infinite;
+        white-space: nowrap;
+    }
+    .territory-loading-message-0 { animation-delay: 0s; }
+    .territory-loading-message-1 { animation-delay: 5s; }
+    .territory-loading-message-2 { animation-delay: 10s; }
+    .territory-loading-message-3 { animation-delay: 15s; }
+    .territory-guidance {
+        padding: 0.65rem 0.8rem;
+        border-radius: 0.4rem;
+        background: rgba(128, 128, 128, 0.10);
+        color: rgba(49, 51, 63, 0.78);
+        font-size: 0.9rem;
+    }
+    div[data-baseweb="tag"] {
+        background-color: rgba(128, 128, 128, 0.18) !important;
+        color: inherit !important;
+    }
+    div[data-testid="stDownloadButton"] button {
+        background-color: #0D6B31 !important;
+        border-color: #0D6B31 !important;
+        color: white !important;
+    }
     @keyframes territory-spin {
         to { transform: rotate(360deg); }
+    }
+    @keyframes territory-message-cycle {
+        0%, 24.9% { opacity: 1; }
+        25%, 100% { opacity: 0; }
     }
     </style>
     """,
@@ -538,31 +591,40 @@ if uploaded_kml:
         st.caption(
             f"Detected {detected_territory_count:,} unique territories."
         )
-        st.info(
-            "For the clearest and most accurate results, consider uploading "
-            "and analyzing separate KML files for different territory "
-            "categories, such as Residential, Business, and Letter Writing. "
-            "Combined KML files are supported, but overlapping categories "
-            "require the analysis engine to apply assignment-priority rules."
+        st.markdown(
+            """
+            <div class="territory-guidance">
+                For the most accurate results, consider uploading and analyzing
+                separate KML files for different territory categories, such as
+                Residential, Business, and Letter Writing. Combined KML files
+                are supported, but overlapping maps require the analysis engine
+                to apply assignment-priority rules.
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        standard_groups = [
-            "Residential",
-            "Business",
-            "Letter Writing",
-            "Other",
-        ]
-        group_options = sorted(
-            set(standard_groups + detected_groups),
-            key=natural_keys,
-        )
+        group_label_to_internal = {
+            "Door-to-Door (Residential)": "Residential",
+            "Letter Writing": "Letter Writing",
+            "Business": "Business",
+            "Other": "Other",
+        }
+        group_options = list(group_label_to_internal.keys())
         with st.expander("Review Detected Territory Groups", expanded=True):
             for detected_group in detected_groups:
-                default_group = detected_group or "Residential"
-                default_index = group_options.index(default_group)
-                territory_group_overrides[detected_group] = st.selectbox(
-                    f'Territories detected as "{detected_group}"',
+                normalized_detected = clean_field(detected_group).lower()
+                if "letter" in normalized_detected:
+                    default_label = "Letter Writing"
+                elif "business" in normalized_detected:
+                    default_label = "Business"
+                elif "residential" in normalized_detected:
+                    default_label = "Door-to-Door (Residential)"
+                else:
+                    default_label = "Door-to-Door (Residential)"
+                selected_group_label = st.selectbox(
+                    f'Territories detected as "{detected_group}" should be considered:',
                     options=group_options,
-                    index=default_index,
+                    index=group_options.index(default_label),
                     key=(
                         "territory_group_"
                         + re.sub(
@@ -571,6 +633,9 @@ if uploaded_kml:
                             detected_group,
                         ).strip("_")
                     ),
+                )
+                territory_group_overrides[detected_group] = (
+                    group_label_to_internal[selected_group_label]
                 )
     except Exception as error:
         st.error(f"Unable to inspect territory groups: {error}")
@@ -1236,7 +1301,10 @@ def generate_excel_report(
     selected_excluded_statuses,
     selected_counties,
     county_source_files,
-    county_record_counts,
+    bounding_record_counts,
+    relevant_record_counts,
+    assigned_record_counts,
+    discarded_record_count,
     kml_filename,
     overlap_match_count,
     unassigned_address_count,
@@ -1828,8 +1896,16 @@ def generate_excel_report(
             )
             for county_name in selected_counties
         )
-        county_record_summary = " | ".join(
-            f"{county_name}: {county_record_counts.get(county_name, 0):,}"
+        bounding_record_summary = " | ".join(
+            f"{county_name}: {bounding_record_counts.get(county_name, 0):,}"
+            for county_name in selected_counties
+        )
+        relevant_record_summary = " | ".join(
+            f"{county_name}: {relevant_record_counts.get(county_name, 0):,}"
+            for county_name in selected_counties
+        )
+        assigned_record_summary = " | ".join(
+            f"{county_name}: {assigned_record_counts.get(county_name, 0):,}"
             for county_name in selected_counties
         )
         county_source_summary = " | ".join(
@@ -1846,7 +1922,16 @@ def generate_excel_report(
             ("Apartment Grouping Threshold", f"{apt_threshold} units"),
             ("Counties Included", ", ".join(selected_counties)),
             ("County Datasets Loaded", f"{len(selected_counties):,}"),
-            ("Candidate Records Loaded by County", county_record_summary),
+            ("Records Inside KML Bounding Area", bounding_record_summary),
+            (
+                "Records Near or Inside Territory Polygons",
+                relevant_record_summary,
+            ),
+            ("Assigned Records by County", assigned_record_summary),
+            (
+                "Records Discarded Outside Boundary Review Area",
+                f"{discarded_record_count:,}",
+            ),
             ("Excluded Audit Controls", exclusion_summary),
             (
                 "Address Records Assigned to Map",
@@ -3636,7 +3721,9 @@ def generate_excel_report(
             unassigned_audit = unassigned_gdf.copy()
             unassigned_audit["Territory_Name"] = "Unassigned"
             unassigned_audit["Exclusion Explanation"] = (
-                "Unassigned: Address falls outside of all drawn territory boundaries."
+                "Unassigned: Address falls outside the drawn territory boundary "
+                f"but is within the {BOUNDARY_AUDIT_BUFFER_METERS:g}-meter "
+                "boundary audit area."
             )
             audit_frames.append(unassigned_audit)
 
@@ -3858,6 +3945,10 @@ def generate_excel_report(
                     coordinate_cell.value = float(coordinate_cell.value)
                     coordinate_cell.number_format = "0.################"
 
+        if export_ex_df.empty:
+            ws6["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws6["A2"].font = Font(italic=True, color="666666")
+
         # --- TAB 7: OVERLAP AUDIT ---
         overlap_columns = [
             "Address",
@@ -3971,6 +4062,9 @@ def generate_excel_report(
 
         filter_end_row = max(len(overlap_export_df) + 1, 1)
         ws7.auto_filter.ref = f"A1:I{filter_end_row}"
+        if overlap_export_df.empty:
+            ws7["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws7["A2"].font = Font(italic=True, color="666666")
 
         # --- TAB 8: COUNTY DUPLICATE AUDIT ---
         county_duplicate_columns = [
@@ -4045,6 +4139,9 @@ def generate_excel_report(
             1,
         )
         ws8.auto_filter.ref = f"A1:G{county_duplicate_filter_end}"
+        if county_duplicate_export.empty:
+            ws8["A2"] = "This page is intentionally blank. There is nothing to audit."
+            ws8["A2"].font = Font(italic=True, color="666666")
 
         # --- EXCEL UX POLISH ---
         writer.sheets["Territory Balancing"].freeze_panes = "E2"
@@ -4073,6 +4170,14 @@ if "last_county_signature" not in st.session_state:
     st.session_state["last_county_signature"] = None
 if "last_exclusion_signature" not in st.session_state:
     st.session_state["last_exclusion_signature"] = None
+if "last_settings_signature" not in st.session_state:
+    st.session_state["last_settings_signature"] = None
+
+settings_signature = (
+    congregation_name,
+    goal_range,
+    apartment_threshold,
+)
 
 inputs_changed = (
     uploaded_kml != st.session_state["last_uploaded_kml"]
@@ -4080,6 +4185,7 @@ inputs_changed = (
     or county_signature != st.session_state["last_county_signature"]
     or exclusion_signature
     != st.session_state["last_exclusion_signature"]
+    or settings_signature != st.session_state["last_settings_signature"]
 )
 if inputs_changed:
     if "excel_data" in st.session_state:
@@ -4088,6 +4194,7 @@ if inputs_changed:
     st.session_state["last_group_signature"] = group_signature
     st.session_state["last_county_signature"] = county_signature
     st.session_state["last_exclusion_signature"] = exclusion_signature
+    st.session_state["last_settings_signature"] = settings_signature
 
 if uploaded_kml and "excel_data" not in st.session_state:
     if st.button("Generate Territory Analysis"):
@@ -4137,10 +4244,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
             county_source_files = {}
 
             for county_name in selected_counties:
-                show_loading_status(
-                    status_placeholder,
-                    f"Loading and preparing {county_name} County…",
-                )
+                show_loading_status(status_placeholder)
                 county_gdf = prepare_county_data(
                     county_name=county_name,
                     kml_bounds=kml_bounds,
@@ -4172,33 +4276,77 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 )
 
             kml_gdf = kml_gdf.to_crs(analysis_crs)
-            territory_envelope = kml_gdf.geometry.union_all().envelope
+            territory_union = gpd.GeoSeries(
+                [kml_gdf.geometry.union_all()],
+                crs=analysis_crs,
+            ).make_valid().iloc[0]
+            if territory_union.is_empty:
+                raise ValueError(
+                    "The uploaded KML contains no usable combined territory geometry."
+                )
+            territory_envelope = territory_union.envelope
             parcel_gdf = parcel_gdf[
                 parcel_gdf.geometry.intersects(territory_envelope)
             ].copy()
-            county_record_counts = {
+            bounding_record_counts = {
                 county_name: int(
                     parcel_gdf["Source_County"].eq(county_name).sum()
                 )
                 for county_name in selected_counties
             }
 
-            parcel_gdf, cross_county_duplicate_df = (
+            # Compute representative points once, then retain only records inside
+            # the exact territory union or its small boundary-review buffer.
+            parcel_gdf["_join_point"] = (
+                parcel_gdf.geometry.representative_point()
+            )
+            territory_review_area = territory_union.buffer(
+                BOUNDARY_AUDIT_BUFFER_METERS
+            )
+            relevant_mask = parcel_gdf["_join_point"].covered_by(
+                territory_review_area
+            )
+            relevant_gdf = parcel_gdf[relevant_mask].copy()
+            discarded_record_count = int((~relevant_mask).sum())
+            relevant_record_counts = {
+                county_name: int(
+                    relevant_gdf["Source_County"].eq(county_name).sum()
+                )
+                for county_name in selected_counties
+            }
+
+            inside_mask = relevant_gdf["_join_point"].covered_by(
+                territory_union
+            )
+            assignment_candidates_gdf = relevant_gdf[inside_mask].copy()
+            unassigned_gdf = relevant_gdf[~inside_mask].copy()
+            unassigned_address_count = len(unassigned_gdf)
+
+            relevant_gdf, cross_county_duplicate_df = (
                 find_cross_county_duplicates(
-                    parcel_gdf,
+                    relevant_gdf,
                     state=analysis_state,
                     metric_crs=analysis_crs,
                 )
             )
+            duplicate_flag_lookup = relevant_gdf.set_index(
+                "Source_Record_ID"
+            )["Cross_County_Duplicate_Flag"]
+            assignment_candidates_gdf["Cross_County_Duplicate_Flag"] = (
+                assignment_candidates_gdf["Source_Record_ID"]
+                .map(duplicate_flag_lookup)
+                .fillna("")
+            )
+            unassigned_gdf["Cross_County_Duplicate_Flag"] = (
+                unassigned_gdf["Source_Record_ID"]
+                .map(duplicate_flag_lookup)
+                .fillna("")
+            )
 
-            show_loading_status(
-                status_placeholder,
-                "Analysis engine makes a return visit…",
+            show_loading_status(status_placeholder)
+            parcel_join_gdf = assignment_candidates_gdf.set_geometry(
+                "_join_point"
             )
-            parcel_gdf["_join_point"] = (
-                parcel_gdf.geometry.representative_point()
-            )
-            parcel_join_gdf = parcel_gdf.set_geometry("_join_point")
             kml_gdf = kml_gdf.rename(
                 columns={"geometry": "geometry_terr"}
             ).set_geometry("geometry_terr")
@@ -4218,20 +4366,17 @@ if uploaded_kml and "excel_data" not in st.session_state:
             joined_gdf = joined_gdf.dropna(
                 subset=["Territory_Name"]
             ).copy()
-            assigned_source_ids = set(
-                joined_gdf["Source_Record_ID"].dropna().astype(str)
-            )
-            unassigned_gdf = parcel_gdf[
-                ~parcel_gdf["Source_Record_ID"].astype(str).isin(
-                    assigned_source_ids
+            assigned_record_counts = {
+                county_name: int(
+                    joined_gdf.loc[
+                        joined_gdf["Source_County"].eq(county_name),
+                        "Source_Record_ID",
+                    ].nunique()
                 )
-            ].copy()
-            unassigned_address_count = len(unassigned_gdf)
+                for county_name in selected_counties
+            }
 
-            show_loading_status(
-                status_placeholder,
-                "Analysis engine stamps a letter…",
-            )
+            show_loading_status(status_placeholder)
             _, territory_rank = build_territory_order(kml_gdf)
             joined_gdf, overlap_audit_df, overlap_match_count = (
                 resolve_overlapping_assignments(
@@ -4242,17 +4387,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 )
             )
 
-            show_loading_status(
-                status_placeholder,
-                random.choice(
-                    [
-                        "Analysis engine stops for coffee…",
-                        "Analysis engine gets a new call…",
-                        "Analysis engine makes a return visit…",
-                        "Analysis engine stamps a letter…",
-                    ]
-                ),
-            )
+            show_loading_status(status_placeholder)
 
             excel_file = generate_excel_report(
                 joined_gdf,
@@ -4268,7 +4403,10 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 selected_excluded_statuses=selected_excluded_statuses,
                 selected_counties=selected_counties,
                 county_source_files=county_source_files,
-                county_record_counts=county_record_counts,
+                bounding_record_counts=bounding_record_counts,
+                relevant_record_counts=relevant_record_counts,
+                assigned_record_counts=assigned_record_counts,
+                discarded_record_count=discarded_record_count,
                 kml_filename=uploaded_kml.name,
                 overlap_match_count=overlap_match_count,
                 unassigned_address_count=unassigned_address_count,
