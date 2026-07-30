@@ -26,11 +26,33 @@ if uploaded_file:
             columns_list = df.columns.tolist()
             st.write(columns_list)
             
-            # 2. Show a preview of the data so the user can see what's inside the columns
-            st.subheader("👀 Data Preview (First 5 Rows)")
-            st.dataframe(df.head())
+            # 2. Show a preview of the data (First 10 Rows)
+            st.subheader("👀 Data Preview (First 10 Rows)")
+            st.dataframe(df.head(10))
             
-            # 3. Provide a checklist for the user
+            # Quick view for the whole data table
+            with st.expander("View Full Data Table (Click to expand)"):
+                st.warning("Note: Loading the full table may take a few seconds for very large county datasets.")
+                st.dataframe(df)
+
+            # 3. Excluded Classes Analyzer (with Value Counts)
+            st.subheader("🔍 Property Status Analyzer (Find your exclusions)")
+            st.markdown("Select the column that likely holds the property class/status to see how many times each value appears.")
+            
+            status_col = st.selectbox("Select Status Column:", ["-- Select a Column --"] + columns_list)
+
+            if status_col != "-- Select a Column --":
+                st.write(f"**Value Counts for `{status_col}`:**")
+                # Calculate value counts, including NaN/Null values so you know if data is missing
+                value_counts = df[status_col].value_counts(dropna=False).reset_index()
+                value_counts.columns = [status_col, "Count"]
+                
+                # Display as an interactive table
+                st.dataframe(value_counts)
+            
+            st.divider()
+
+            # 4. Provide a checklist for the user
             st.subheader("✅ Your Mission Checklist")
             st.markdown("""
             Look at the columns and data above. Find the exact matching column name for:
