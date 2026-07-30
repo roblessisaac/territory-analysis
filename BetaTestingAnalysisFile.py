@@ -12,6 +12,7 @@ import datetime
 import re
 import random
 from fractions import Fraction
+from itertools import combinations
 
 # Enable KML support in GeoPandas yippe!
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
@@ -79,6 +80,276 @@ REQUIRED_CANONICAL_COLUMNS = [
     "Canonical_Status", "geometry",
 ]
 
+
+def clean_field(value):
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() in {"nan", "none", "<na>"}:
+        return ""
+    return text
+
+
+def natural_keys(text):
+    return [
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", str(text))
+    ]
+
+
+def assign_territory_names(kml_gdf):
+    kml_gdf = kml_gdf.copy()
+    fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
+
+    if "Name" in kml_gdf.columns:
+        names = kml_gdf["Name"]
+    elif "Description" in kml_gdf.columns:
+        names = kml_gdf["Description"]
+    else:
+        names = fallback_names
+
+    if isinstance(names, pd.Series):
+        names = names.replace(r"^\s*$", pd.NA, regex=True).fillna(
+            fallback_names
+        )
+
+    kml_gdf["Territory_Name"] = names.astype(str).str.strip()
+    return kml_gdf
+
+
+def detect_territory_group(territory_name):
+    name = clean_field(territory_name)
+    if not name:
+        return "Residential"
+
+    group_name = re.sub(
+        r"(?:[\s_-]+)?\d+[A-Za-z]?$",
+        "",
+        name,
+    ).strip(" -_")
+    group_name = re.sub(r"[\s_-]+", " ", group_name).strip()
+
+    if not group_name or group_name.lower() in {
+        "territory",
+        "imported",
+        "(imported)",
+    }:
+        return "Residential"
+    return group_name
+
+
+def apply_territory_groups(kml_gdf, group_overrides=None):
+    group_overrides = group_overrides or {}
+    kml_gdf = kml_gdf.copy()
+    kml_gdf["Detected_Territory_Group"] = kml_gdf[
+        "Territory_Name"
+    ].map(detect_territory_group)
+    kml_gdf["Territory_Group"] = kml_gdf[
+        "Detected_Territory_Group"
+    ].map(lambda group: clean_field(group_overrides.get(group, group)))
+    kml_gdf["Territory_Group"] = kml_gdf["Territory_Group"].replace(
+        "",
+        "Residential",
+    )
+    return kml_gdf
+
+
+def build_territory_order(kml_gdf):
+    territory_records = (
+        kml_gdf[["Territory_Name", "Territory_Group"]]
+        .dropna(subset=["Territory_Name"])
+        .drop_duplicates(subset=["Territory_Name"], keep="first")
+    )
+    records = territory_records.to_dict("records")
+    records.sort(
+        key=lambda record: (
+            natural_keys(record["Territory_Group"]),
+            natural_keys(record["Territory_Name"]),
+        )
+    )
+    territory_order = [record["Territory_Name"] for record in records]
+    territory_rank = {
+        territory_name: rank
+        for rank, territory_name in enumerate(territory_order)
+    }
+    return territory_order, territory_rank
+
+
+@st.cache_data
+def inspect_kml_territory_groups(kml_bytes):
+    preview_gdf = gpd.read_file(io.BytesIO(kml_bytes), driver="KML")
+    preview_gdf = assign_territory_names(preview_gdf)
+    preview_gdf = apply_territory_groups(preview_gdf)
+    detected_groups = preview_gdf["Detected_Territory_Group"].unique().tolist()
+    detected_groups.sort(key=natural_keys)
+    return detected_groups, len(preview_gdf["Territory_Name"].unique())
+
+
+def resolve_overlapping_assignments(
+    joined_gdf,
+    kml_gdf,
+    metric_crs,
+    territory_rank,
+):
+    """Keep one assignment per source record and territory group.
+
+    Cross-group assignments are retained. Within a single group, the primary
+    territory is the polygon whose internal representative point is nearest to
+    the address point. Natural territory order is the deterministic tie-breaker.
+    """
+    if joined_gdf.empty:
+        empty_audit = pd.DataFrame()
+        return joined_gdf.copy(), empty_audit, 0
+
+    matches = joined_gdf.reset_index(drop=True).copy()
+    matches["_Match_ID"] = matches.index
+    matches["_Territory_Rank"] = (
+        matches["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
+
+    territory_reference_gdf = (
+        kml_gdf[["Territory_Name", "geometry_terr"]]
+        .dropna(subset=["Territory_Name", "geometry_terr"])
+        .set_geometry("geometry_terr")
+        .dissolve(by="Territory_Name")
+        .to_crs(metric_crs)
+    )
+    territory_reference_gdf["_Reference_Point"] = (
+        territory_reference_gdf.geometry.representative_point()
+    )
+    reference_lookup = territory_reference_gdf[
+        "_Reference_Point"
+    ].to_dict()
+
+    match_points_metric = gpd.GeoDataFrame(
+        matches.copy(),
+        geometry="_join_point",
+        crs=joined_gdf.crs,
+    ).to_crs(metric_crs)
+    reference_points = gpd.GeoSeries(
+        matches["Territory_Name"].map(reference_lookup),
+        index=matches.index,
+        crs=metric_crs,
+    )
+    matches["_Assignment_Distance"] = (
+        match_points_metric.geometry.distance(reference_points, align=False)
+    )
+    matches["_Assignment_Distance"] = matches[
+        "_Assignment_Distance"
+    ].fillna(float("inf"))
+
+    ordered_matches = matches.sort_values(
+        by=[
+            "Source_Record_ID",
+            "Territory_Group",
+            "_Assignment_Distance",
+            "_Territory_Rank",
+            "_Match_ID",
+        ],
+        kind="stable",
+    )
+    selected_matches = ordered_matches.drop_duplicates(
+        subset=["Source_Record_ID", "Territory_Group"],
+        keep="first",
+    ).copy()
+
+    source_match_counts = matches.groupby("Source_Record_ID").size()
+    overlapping_source_ids = source_match_counts[
+        source_match_counts > 1
+    ].index
+    overlap_match_count = int(
+        (source_match_counts[source_match_counts > 1] - 1).sum()
+    )
+
+    audit_rows = []
+    overlap_matches = matches[
+        matches["Source_Record_ID"].isin(overlapping_source_ids)
+    ]
+    selected_overlaps = selected_matches[
+        selected_matches["Source_Record_ID"].isin(overlapping_source_ids)
+    ]
+
+    for source_record_id, source_rows in overlap_matches.groupby(
+        "Source_Record_ID",
+        sort=False,
+    ):
+        final_rows = selected_overlaps[
+            selected_overlaps["Source_Record_ID"] == source_record_id
+        ].sort_values(by="_Territory_Rank", kind="stable")
+
+        for (_, assigned_row), (_, additional_row) in combinations(
+            final_rows.iterrows(),
+            2,
+        ):
+            audit_row = assigned_row.to_dict()
+            audit_row.update(
+                {
+                    "Assigned_Territory": assigned_row["Territory_Name"],
+                    "Additional_Territory": additional_row["Territory_Name"],
+                    "Assigned_Group": assigned_row["Territory_Group"],
+                    "Additional_Group": additional_row["Territory_Group"],
+                    "Overlap_Type": "Allowed Cross-Group Overlap",
+                    "Resolution": "Retained in both territories",
+                }
+            )
+            audit_rows.append(audit_row)
+
+        for territory_group, group_rows in source_rows.groupby(
+            "Territory_Group",
+            sort=False,
+        ):
+            if len(group_rows) <= 1:
+                continue
+
+            primary_row = selected_matches[
+                (selected_matches["Source_Record_ID"] == source_record_id)
+                & (selected_matches["Territory_Group"] == territory_group)
+            ].iloc[0]
+            additional_rows = group_rows[
+                group_rows["_Match_ID"] != primary_row["_Match_ID"]
+            ].sort_values(by="_Territory_Rank", kind="stable")
+
+            for _, additional_row in additional_rows.iterrows():
+                audit_row = primary_row.to_dict()
+                audit_row.update(
+                    {
+                        "Assigned_Territory": primary_row["Territory_Name"],
+                        "Additional_Territory": additional_row[
+                            "Territory_Name"
+                        ],
+                        "Assigned_Group": territory_group,
+                        "Additional_Group": territory_group,
+                        "Overlap_Type": "Same-Group Review",
+                        "Resolution": (
+                            f"Assigned to {primary_row['Territory_Name']} using "
+                            "the nearest territory reference point; "
+                            f"{additional_row['Territory_Name']} requires map "
+                            "review."
+                        ),
+                    }
+                )
+                audit_rows.append(audit_row)
+
+    overlap_audit_df = pd.DataFrame(audit_rows)
+    helper_columns = [
+        "_Match_ID",
+        "_Territory_Rank",
+        "_Assignment_Distance",
+        "_join_point",
+        "index_right",
+    ]
+    selected_matches = selected_matches.drop(
+        columns=helper_columns,
+        errors="ignore",
+    )
+    selected_matches = gpd.GeoDataFrame(
+        selected_matches,
+        geometry="geometry",
+        crs=joined_gdf.crs,
+    )
+    return selected_matches, overlap_audit_df, overlap_match_count
+
+
 # --- 1. CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide")
 
@@ -111,7 +382,50 @@ with st.sidebar.expander("Advanced Settings"):
 st.header("Step 2: Upload Your Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
 
+territory_group_overrides = {}
+if uploaded_kml:
+    try:
+        detected_groups, detected_territory_count = (
+            inspect_kml_territory_groups(uploaded_kml.getvalue())
+        )
+        st.header("Step 3: Confirm Territory Groups")
+        st.caption(
+            f"Detected {detected_territory_count:,} unique territories. "
+            "Addresses may be retained in overlapping territories when the "
+            "territories belong to different groups."
+        )
+        standard_groups = [
+            "Residential",
+            "Business",
+            "Letter Writing",
+            "Other",
+        ]
+        group_options = sorted(
+            set(standard_groups + detected_groups),
+            key=natural_keys,
+        )
+        with st.expander("Review Detected Territory Groups", expanded=True):
+            for detected_group in detected_groups:
+                default_group = detected_group or "Residential"
+                default_index = group_options.index(default_group)
+                territory_group_overrides[detected_group] = st.selectbox(
+                    f'Territories detected as "{detected_group}"',
+                    options=group_options,
+                    index=default_index,
+                    key=(
+                        "territory_group_"
+                        + re.sub(
+                            r"[^A-Za-z0-9]+",
+                            "_",
+                            detected_group,
+                        ).strip("_")
+                    ),
+                )
+    except Exception as error:
+        st.error(f"Unable to inspect territory groups: {error}")
+
 MIN_GOAL, MAX_GOAL = [int(x) for x in goal_range.split("-")]
+group_signature = tuple(sorted(territory_group_overrides.items()))
 
 # --- 2. DATA LOADING & CACHING ---
 @st.cache_data
@@ -123,16 +437,7 @@ def load_county_data(county_name):
         st.error(f"Error loading county shapefile. Check the configured file path. Error: {error}")
         return None
 
-def natural_keys(text):
-    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', str(text))]
-
 # --- ADDRESS BUILDER + NORMALIZATION HELPERS ---
-def clean_field(value):
-    if pd.isna(value): return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "<na>"}: return ""
-    return text
-
 def normalize_house_number(value):
     text = clean_field(value)
     if not text: return ""
@@ -532,6 +837,7 @@ def parse_mailable_address(row, state):
 def generate_excel_report(
     joined_gdf,
     unassigned_gdf,
+    overlap_audit_df,
     kml_gdf,
     min_goal,
     max_goal,
@@ -541,7 +847,7 @@ def generate_excel_report(
     selected_excluded_statuses,
     kml_filename,
     county_filename,
-    duplicate_assignment_count,
+    overlap_match_count,
     unassigned_address_count,
 ):
     output = io.BytesIO()
@@ -549,37 +855,174 @@ def generate_excel_report(
     state = county_config["state"]
     metric_crs = county_config["metric_crs"]
     excluded_statuses = list(selected_excluded_statuses)
+    territory_order, territory_rank = build_territory_order(kml_gdf)
+    territory_group_lookup = (
+        kml_gdf[["Territory_Name", "Territory_Group"]]
+        .drop_duplicates(subset=["Territory_Name"], keep="first")
+        .set_index("Territory_Name")["Territory_Group"]
+        .to_dict()
+    )
 
     joined_gdf = joined_gdf.copy()
-    joined_gdf["Canonical_Zip_Code"] = joined_gdf["Canonical_Zip_Code"].map(normalize_zip_code)
-    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(lambda row: build_addresses(row, state), axis=1)
-    joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(evaluate_data_quality, axis=1)
-    flagged_record_count = joined_gdf["Data_Quality_Flag"].ne("").sum()
+    joined_gdf["Canonical_Zip_Code"] = joined_gdf[
+        "Canonical_Zip_Code"
+    ].map(normalize_zip_code)
+    joined_gdf[["Base_Address", "Mailable_Address"]] = joined_gdf.apply(
+        lambda row: build_addresses(row, state),
+        axis=1,
+    )
+    joined_gdf["Data_Quality_Flag"] = joined_gdf.apply(
+        evaluate_data_quality,
+        axis=1,
+    )
+    flagged_record_count = int(
+        joined_gdf["Data_Quality_Flag"].ne("").sum()
+    )
 
-    normalized_excluded_statuses = {clean_field(status).upper() for status in excluded_statuses}
-    joined_gdf["Canonical_Status_Normalized"] = joined_gdf["Canonical_Status"].map(clean_field).str.upper()
-    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(normalized_excluded_statuses)
+    normalized_excluded_statuses = {
+        clean_field(status).upper() for status in excluded_statuses
+    }
+    joined_gdf["Canonical_Status_Normalized"] = joined_gdf[
+        "Canonical_Status"
+    ].map(clean_field).str.upper()
+    exclusion_mask = joined_gdf["Canonical_Status_Normalized"].isin(
+        normalized_excluded_statuses
+    )
     excluded_gdf = joined_gdf[exclusion_mask].copy()
     valid_gdf = joined_gdf[~exclusion_mask].copy()
 
-    unique_territories = valid_gdf["Territory_Name"].unique().tolist()
-    unique_territories.sort(key=natural_keys)
-    valid_gdf["Territory_Name"] = pd.Categorical(valid_gdf["Territory_Name"], categories=unique_territories, ordered=True)
+    valid_gdf["_Territory_Order"] = (
+        valid_gdf["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
+    excluded_gdf["_Territory_Order"] = (
+        excluded_gdf["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
 
-    if not excluded_gdf.empty:
-        excluded_unique = excluded_gdf["Territory_Name"].unique().tolist()
-        excluded_unique.sort(key=natural_keys)
-        excluded_gdf["Territory_Name"] = pd.Categorical(excluded_gdf["Territory_Name"], categories=excluded_unique, ordered=True)
+    unique_physical_address_count = int(
+        valid_gdf["Source_Record_ID"].nunique()
+    )
+    territory_assignment_count = len(valid_gdf)
+    excluded_address_count = int(
+        excluded_gdf["Source_Record_ID"].nunique()
+    )
 
-    counts_df = valid_gdf.groupby("Territory_Name", observed=True).size().reset_index(name="Total_Addresses")
-    counts_df = counts_df[counts_df["Total_Addresses"] > 0].copy()
+    source_group_counts = valid_gdf.groupby("Source_Record_ID")[
+        "Territory_Group"
+    ].nunique()
+    cross_group_shared_source_ids = set(
+        source_group_counts[source_group_counts > 1].index
+    )
+    cross_group_shared_address_count = len(
+        cross_group_shared_source_ids
+    )
+    shared_across_groups_by_territory = (
+        valid_gdf[
+            valid_gdf["Source_Record_ID"].isin(
+                cross_group_shared_source_ids
+            )
+        ]
+        .groupby("Territory_Name")["Source_Record_ID"]
+        .nunique()
+        .to_dict()
+    )
+
+    if overlap_audit_df is None or overlap_audit_df.empty:
+        valid_overlap_audit_df = pd.DataFrame()
+    else:
+        valid_overlap_audit_df = overlap_audit_df.copy()
+        valid_overlap_audit_df["Canonical_Status_Normalized"] = (
+            valid_overlap_audit_df["Canonical_Status"]
+            .map(clean_field)
+            .str.upper()
+        )
+        valid_overlap_audit_df = valid_overlap_audit_df[
+            ~valid_overlap_audit_df["Canonical_Status_Normalized"].isin(
+                normalized_excluded_statuses
+            )
+        ].copy()
+        valid_overlap_audit_df["Canonical_Zip_Code"] = (
+            valid_overlap_audit_df["Canonical_Zip_Code"].map(
+                normalize_zip_code
+            )
+        )
+        valid_overlap_audit_df[
+            ["Base_Address", "Mailable_Address"]
+        ] = valid_overlap_audit_df.apply(
+            lambda row: build_addresses(row, state),
+            axis=1,
+        )
+        valid_overlap_audit_df["Address"] = valid_overlap_audit_df[
+            "Mailable_Address"
+        ]
+
+    if valid_overlap_audit_df.empty:
+        same_group_overlap_address_count = 0
+        same_group_overlaps_by_territory = {}
+    else:
+        same_group_audit = valid_overlap_audit_df[
+            valid_overlap_audit_df["Overlap_Type"].eq(
+                "Same-Group Review"
+            )
+        ].copy()
+        same_group_overlap_address_count = int(
+            same_group_audit["Source_Record_ID"].nunique()
+        )
+        assigned_involvement = same_group_audit[
+            ["Source_Record_ID", "Assigned_Territory"]
+        ].rename(columns={"Assigned_Territory": "Territory_Name"})
+        additional_involvement = same_group_audit[
+            ["Source_Record_ID", "Additional_Territory"]
+        ].rename(columns={"Additional_Territory": "Territory_Name"})
+        same_group_involvement = pd.concat(
+            [assigned_involvement, additional_involvement],
+            ignore_index=True,
+        ).drop_duplicates()
+        same_group_overlaps_by_territory = (
+            same_group_involvement.groupby("Territory_Name")[
+                "Source_Record_ID"
+            ]
+            .nunique()
+            .to_dict()
+        )
+
+    all_territories_df = pd.DataFrame(
+        {
+            "Territory_Name": territory_order,
+            "Territory_Group": [
+                territory_group_lookup.get(name, "Residential")
+                for name in territory_order
+            ],
+        }
+    )
+    valid_counts = (
+        valid_gdf.groupby("Territory_Name")
+        .size()
+        .reset_index(name="Total_Addresses")
+    )
+    counts_df = all_territories_df.merge(
+        valid_counts,
+        on="Territory_Name",
+        how="left",
+    )
+    counts_df["Total_Addresses"] = (
+        counts_df["Total_Addresses"].fillna(0).astype(int)
+    )
+    counts_df["_Territory_Order"] = counts_df["Territory_Name"].map(
+        territory_rank
+    )
 
     def get_category(count):
-        if count < min_goal: return "Undersized"
-        if count <= max_goal: return "Ideal"
+        if count == 0:
+            return "No Assigned Addresses"
+        if count < min_goal:
+            return "Undersized"
+        if count <= max_goal:
+            return "Ideal"
         return "Oversized"
 
-    counts_df["Category"] = counts_df["Total_Addresses"].apply(get_category)
+    counts_df["Category"] = counts_df["Total_Addresses"].apply(
+        get_category
+    )
 
     valid_gdf[["NWS_Category", "NWS_Number"]] = valid_gdf["Territory_Name"].astype(str).str.extract(r"^([A-Za-z]+)[-\s]+(.*)$")
     valid_gdf["NWS_Category"] = valid_gdf["NWS_Category"].fillna("UNK")
@@ -657,12 +1100,21 @@ def generate_excel_report(
     apt_groups = apt_groups[
         apt_groups["Total Units"] >= apt_threshold
     ].copy()
+    apt_groups["_Territory_Order"] = (
+        apt_groups["Territory_Name"]
+        .map(territory_rank)
+        .fillna(float("inf"))
+    )
+    apt_groups = apt_groups.sort_values(
+        by=["_Territory_Order", "Base_Address"],
+        kind="stable",
+    ).reset_index(drop=True)
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         
         # --- TAB 1: DASHBOARD ---
         total_territories = len(counts_df)
-        total_addresses = counts_df["Total_Addresses"].sum()
+        total_addresses = unique_physical_address_count
         largest_terr = counts_df.loc[counts_df["Total_Addresses"].idxmax()] if total_territories > 0 else None
         smallest_terr = counts_df.loc[counts_df["Total_Addresses"].idxmin()] if total_territories > 0 else None
         ideal_pct = (len(counts_df[counts_df["Category"] == "Ideal"]) / total_territories * 100) if total_territories > 0 else 0
@@ -679,7 +1131,7 @@ def generate_excel_report(
             ["Quick Facts:"],
             [f"Total Territories: {total_territories}"],
             [f"Total Valid Addresses: {total_addresses}"],
-            [f"Excluded Addresses (See Tab 6): {len(excluded_gdf)}"],
+            [f"Excluded Addresses (See Tab 6): {excluded_address_count}"],
             [f"The largest territory has {largest_count} addresses in it ({largest_name})."],
             [f"The smallest territory has {smallest_count} addresses in it ({smallest_name})."],
             [""],
@@ -806,16 +1258,65 @@ def generate_excel_report(
             ws1.cell(row=features_start, column=col).fill = features_fill
 
         feature_instructions = [
-            "The DASHBOARD tab displays basic statistics about the territory that was analyzed. It also displays basic information on how the report is organized.",
-            "The COUNTS tab organizes territories by size. This is done by 'counting' workable addresses, not geographical size (although that is a measured statistic). Through the counts tab, you gain insight into individual territories' density.",
-            "The ADDRESS LIST tab displays every workable address in your territory. This is what most of the engine's analysis is based off of! Any questionable entries are flagged with a data warning.",
-            "The APARTMENTS tab displays every multifamily at/above your apartment grouping threshold (defaulting @ 5 units = an apartment). Large apartment units can inflate territories sizes. These units can be turned into letter writing territory.",
-            "The TERRITORY BALANCING tab provides reduction, consolidation, and border-shift recommendations for \"balancing\" your territory density. It's a great launching off spot for remapping territory borders.",
-            "The EXCLUDED AUDIT tab displays addresses that are NOT counted towards your territory. These are usually addresses of highways, vacant lots, parks, etc. Addresses right outside your territory borders will be included here too. This is included for auditing purposes.",
-            "The addresses in this analysis, with a little reformatting, can be added to NWS or other supported programs (Visit https://territorytoolbox.com for details). It's suggested to export this file into a program you can easily edit, like excel or google sheets. That will allow you to expand cells to read easier, create custom filters to see specific data, and customize the sheet to make it more legible.",
+            (
+                "DASHBOARD",
+                "The ",
+                " tab displays basic statistics about the territory that was "
+                "analyzed. It also displays basic information on how the report "
+                "is organized.",
+            ),
+            (
+                "COUNTS",
+                "The ",
+                " tab organizes territories by size. This is done by 'counting' "
+                "workable addresses, not geographical size (although that is a "
+                "measured statistic). Through the counts tab, you gain insight "
+                "into individual territories' density.",
+            ),
+            (
+                "ADDRESS LIST",
+                "The ",
+                " tab displays every workable address in your territory. This is "
+                "what most of the engine's analysis is based off of! Any "
+                "questionable entries are flagged with a data warning.",
+            ),
+            (
+                "APARTMENTS",
+                "The ",
+                " tab displays every multifamily at/above your apartment grouping "
+                "threshold (defaulting @ 5 units = an apartment). Large apartment "
+                "units can inflate territories sizes. These units can be turned "
+                "into letter writing territory.",
+            ),
+            (
+                "TERRITORY BALANCING",
+                "The ",
+                " tab provides reduction, consolidation, and border-shift "
+                "recommendations for \"balancing\" your territory density. It's a "
+                "great launching off spot for remapping territory borders.",
+            ),
+            (
+                "EXCLUDED AUDIT",
+                "The ",
+                " tab displays addresses that are NOT counted towards your "
+                "territory. These are usually addresses of highways, vacant lots, "
+                "parks, etc. Addresses right outside your territory borders will "
+                "be included here too. This is included for auditing purposes.",
+            ),
+            (
+                "OVERLAP AUDIT",
+                "The ",
+                " tab displays addresses assigned to multiple territories. "
+                "Cross-group overlaps are retained as valid assignments, while "
+                "conflicting addresses within the same territory group are "
+                "assigned once and flagged for manual review.",
+            ),
         ]
 
-        for offset, instruction in enumerate(feature_instructions, start=1):
+        for offset, (tab_name, prefix, suffix) in enumerate(
+            feature_instructions,
+            start=1,
+        ):
             row_number = features_start + offset
             ws1.merge_cells(
                 start_row=row_number,
@@ -823,17 +1324,48 @@ def generate_excel_report(
                 end_row=row_number,
                 end_column=8,
             )
-            cell = ws1.cell(row=row_number, column=1, value=instruction)
+            cell = ws1.cell(row=row_number, column=1)
+            cell.value = CellRichText(
+                prefix,
+                TextBlock(bold_inline, tab_name),
+                suffix,
+            )
             cell.alignment = Alignment(
                 horizontal="left",
                 vertical="top",
                 wrap_text=True,
             )
-            if "https://territorytoolbox.com" in instruction:
-                cell.hyperlink = "https://territorytoolbox.com"
-                cell.font = Font(color="0563C1", underline="single")
 
-        technical_start = features_start + len(feature_instructions) + 2
+        final_feature_row = features_start + len(feature_instructions) + 1
+        ws1.merge_cells(
+            start_row=final_feature_row,
+            start_column=1,
+            end_row=final_feature_row,
+            end_column=8,
+        )
+        final_feature_text = (
+            "The addresses in this analysis, with a little reformatting, can be "
+            "added to NWS or other supported programs (Visit "
+            "https://territorytoolbox.com for details). It's suggested to export "
+            "this file into a program you can easily edit, like excel or google "
+            "sheets. That will allow you to expand cells to read easier, create "
+            "custom filters to see specific data, and customize the sheet to make "
+            "it more legible."
+        )
+        final_feature_cell = ws1.cell(
+            row=final_feature_row,
+            column=1,
+            value=final_feature_text,
+        )
+        final_feature_cell.alignment = Alignment(
+            horizontal="left",
+            vertical="top",
+            wrap_text=True,
+        )
+        final_feature_cell.hyperlink = "https://territorytoolbox.com"
+        final_feature_cell.font = Font(color="0563C1", underline="single")
+
+        technical_start = final_feature_row + 2
         technical_fill = PatternFill(
             start_color="C7CDDB",
             end_color="C7CDDB",
@@ -864,14 +1396,35 @@ def generate_excel_report(
                 if selected_excluded_statuses
                 else "None selected",
             ),
-            ("Address Records Loaded", len(joined_gdf)),
-            ("Valid Addresses Assigned", len(valid_gdf)),
-            ("Excluded Address Count", len(excluded_gdf)),
-            ("Records Flagged with Warnings", flagged_record_count),
+            (
+                "Address Records Loaded",
+                f"{joined_gdf['Source_Record_ID'].nunique():,}",
+            ),
+            (
+                "Unique Physical Addresses",
+                f"{unique_physical_address_count:,}",
+            ),
+            (
+                "Territory Assignments Created",
+                f"{territory_assignment_count:,}",
+            ),
+            (
+                "Addresses Shared Across Groups",
+                f"{cross_group_shared_address_count:,}",
+            ),
+            (
+                "Same-Group Overlaps Needing Review",
+                f"{same_group_overlap_address_count:,}",
+            ),
+            ("Excluded Address Count", f"{excluded_address_count:,}"),
+            ("Records Flagged with Warnings", f"{flagged_record_count:,}"),
             ("KML Filename", kml_filename),
             ("County Source Filename", county_filename),
-            ("Duplicate Boundary Assignments", duplicate_assignment_count),
-            ("Unassigned Address Records", unassigned_address_count),
+            (
+                "Overlapping Address-to-Territory Matches",
+                f"{overlap_match_count:,}",
+            ),
+            ("Unassigned Address Records", f"{unassigned_address_count:,}"),
         ]
 
         for offset, (label, value) in enumerate(tech_info, start=1):
@@ -900,6 +1453,34 @@ def generate_excel_report(
                 vertical="top",
                 wrap_text=True,
             )
+
+        assignment_note_row = technical_start + len(tech_info) + 1
+        ws1.merge_cells(
+            start_row=assignment_note_row,
+            start_column=1,
+            end_row=assignment_note_row,
+            end_column=8,
+        )
+        assignment_note = ws1.cell(
+            row=assignment_note_row,
+            column=1,
+            value=(
+                f"The total territory assignment count is "
+                f"{territory_assignment_count:,}. If this differs from the "
+                "‘Total Valid Addresses’ figure, the uploaded map contains "
+                "overlapping territory types. It is normal for addresses to "
+                "appear in multiple territories across different groups, such "
+                "as Residential and Business. However, same-group overlaps are "
+                "assigned only once and flagged for review. Addresses listed in "
+                "the Overlap Audit may indicate an error in your maps."
+            ),
+        )
+        assignment_note.alignment = Alignment(
+            horizontal="left",
+            vertical="top",
+            wrap_text=True,
+        )
+        ws1.row_dimensions[assignment_note_row].height = 60
 
         ws1.delete_cols(17, 10)
 
@@ -982,20 +1563,69 @@ def generate_excel_report(
             ("Ideal", "Oversized"): "This is impossible.",
             ("Undersized", "Oversized"): "This is impossible.",
         }
-        counts_df_sorted["Suggested Action"] = counts_df_sorted.apply(
-            lambda row: suggested_actions.get(
-                (row["Category"], row["Potential Status"]),
+        def get_suggested_action(row):
+            if row["Category"] == "No Assigned Addresses":
+                return (
+                    "Review this territory. No valid addresses were assigned. "
+                    "It may overlap another territory, contain only excluded "
+                    "records, or contain no county address points."
+                )
+            potential_status = row["Potential Status"]
+            if potential_status == "No Assigned Addresses":
+                potential_status = "Undersized"
+            return suggested_actions.get(
+                (row["Category"], potential_status),
                 "Review territory manually",
-            ),
+            )
+
+        counts_df_sorted["Suggested Action"] = counts_df_sorted.apply(
+            get_suggested_action,
             axis=1,
         )
+        counts_df_sorted["Shared Across Groups"] = (
+            counts_df_sorted["Territory_Name"]
+            .map(shared_across_groups_by_territory)
+            .fillna(0)
+            .astype(int)
+        )
+        counts_df_sorted["Same-Group Overlaps"] = (
+            counts_df_sorted["Territory_Name"]
+            .map(same_group_overlaps_by_territory)
+            .fillna(0)
+            .astype(int)
+        )
 
+        def get_overlap_review(row):
+            same_group_count = int(row["Same-Group Overlaps"])
+            shared_count = int(row["Shared Across Groups"])
+            territory_count = int(row["Total_Addresses"])
+            high_overlap = same_group_count >= 10 or (
+                territory_count > 0
+                and same_group_count / territory_count >= 0.10
+            )
+
+            if same_group_count and high_overlap:
+                return "High-overlap territory — review recommended"
+            if same_group_count:
+                suffix = "overlap" if same_group_count == 1 else "overlaps"
+                return f"Review {same_group_count} same-group {suffix}"
+            if shared_count:
+                return "Cross-group overlap only"
+            return "No overlap detected"
+
+        counts_df_sorted["Overlap Review"] = counts_df_sorted.apply(
+            get_overlap_review,
+            axis=1,
+        )
         counts_df_sorted = (
-            counts_df_sorted.sort_values(by="Territory_Name")
+            counts_df_sorted.sort_values(
+                by="_Territory_Order",
+                kind="stable",
+            )
             .rename(
                 columns={
                     "Territory_Name": "Territory Name",
-                    "Total_Addresses": "Total Address Count",
+                    "Total_Addresses": "Territory Address Count",
                     "Category": "Current Status",
                     "# of Apartment Units": "Apartment Units",
                     "Addresses With Apartments Removed": "Total Count w/o Apts",
@@ -1005,12 +1635,15 @@ def generate_excel_report(
                 [
                     "Territory Name",
                     "Size (Sq Acres)",
-                    "Total Address Count",
+                    "Territory Address Count",
                     "Current Status",
                     "Apartment Units",
                     "Total Count w/o Apts",
                     "Apartmentless Status",
                     "Suggested Action",
+                    "Shared Across Groups",
+                    "Same-Group Overlaps",
+                    "Overlap Review",
                 ]
             ]
         )
@@ -1026,12 +1659,15 @@ def generate_excel_report(
         counts_widths = {
             "A": 14,
             "B": 14,
-            "C": 14,
+            "C": 18,
             "D": 18,
             "E": 14,
             "F": 18,
             "G": 18,
             "H": 92,
+            "I": 18,
+            "J": 18,
+            "K": 38,
         }
         for column_letter, width in counts_widths.items():
             ws2.column_dimensions[column_letter].width = width
@@ -1079,16 +1715,35 @@ def generate_excel_report(
         bottom_border = Border(
             bottom=Side(style="thin", color="666666")
         )
+        overlap_header_fill = PatternFill(
+            start_color="C7CDDB",
+            end_color="C7CDDB",
+            fill_type="solid",
+        )
+        overlap_warning_fill = PatternFill(
+            start_color="FFF2CC",
+            end_color="FFF2CC",
+            fill_type="solid",
+        )
+        overlap_left_side = Side(style="medium", color="666666")
 
-        for cell in ws2[1]:
-            cell.fill = header_fill_counts
-            cell.font = Font(bold=True, color="EAECEB", size=12)
+        for column_number, cell in enumerate(ws2[1], start=1):
+            if column_number >= 9:
+                cell.fill = overlap_header_fill
+                cell.font = Font(bold=True, color="000000", size=12)
+            else:
+                cell.fill = header_fill_counts
+                cell.font = Font(bold=True, color="EAECEB", size=12)
             cell.alignment = Alignment(
                 horizontal="center",
                 vertical="center",
                 wrap_text=True,
             )
             cell.border = bottom_border
+        ws2.cell(row=1, column=9).border = Border(
+            left=overlap_left_side,
+            bottom=Side(style="thin", color="666666"),
+        )
 
         for row_number in range(2, len(counts_df_sorted) + 2):
             current_status = ws2.cell(row=row_number, column=4).value
@@ -1143,7 +1798,27 @@ def generate_excel_report(
                 column=8,
             ).fill = suggested_action_fill
 
-            for column_number in range(1, 9):
+            for column_number in range(9, 12):
+                ws2.cell(
+                    row=row_number,
+                    column=column_number,
+                ).fill = alternate_fill
+
+            same_group_overlap_value = ws2.cell(
+                row=row_number,
+                column=10,
+            ).value
+            if same_group_overlap_value not in {None, "", 0}:
+                ws2.cell(
+                    row=row_number,
+                    column=10,
+                ).fill = overlap_warning_fill
+                ws2.cell(
+                    row=row_number,
+                    column=11,
+                ).fill = overlap_warning_fill
+
+            for column_number in range(1, 12):
                 cell = ws2.cell(
                     row=row_number,
                     column=column_number,
@@ -1155,12 +1830,19 @@ def generate_excel_report(
                 )
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {1, 8} else "center"
+                        "left"
+                        if column_number in {1, 8, 11}
+                        else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
                 )
                 cell.border = bottom_border
+
+            ws2.cell(row=row_number, column=9).border = Border(
+                left=overlap_left_side,
+                bottom=Side(style="thin", color="666666"),
+            )
 
         # --- TAB 3: ADDRESS LIST ---
         valid_gdf["Latitude"] = valid_gdf.geometry.y.astype(float)
@@ -1178,7 +1860,7 @@ def generate_excel_report(
 
         address_list_df = valid_gdf.sort_values(
             by=[
-                "Territory_Name",
+                "_Territory_Order",
                 "Canonical_Street",
                 "HouseNum_Sort",
                 "HouseNum_Suffix_Rank",
@@ -1418,7 +2100,10 @@ def generate_excel_report(
                 return "TEN_PLUS"
             if current_status == "Undersized":
                 return "CURRENT_UNDERSIZED"
-            if potential_status == "Undersized":
+            if potential_status in {
+                "Undersized",
+                "No Assigned Addresses",
+            }:
                 return "POTENTIAL_UNDERSIZED"
             if current_status == "Ideal" and potential_status == "Ideal":
                 return "IDEAL_TO_IDEAL"
@@ -1550,6 +2235,7 @@ def generate_excel_report(
         for column_letter in ["I", "J", "K", "L", "M", "N", "O", "P"]:
             ws4.column_dimensions[column_letter].hidden = True
         ws4.delete_cols(15, 12)
+        apartment_table.ref = f"A1:N{len(apt_export) + 1}"
 
         header_fill = PatternFill(
             start_color="046A34",
@@ -1963,7 +2649,10 @@ def generate_excel_report(
                     "Shift_Baseline_Count",
                 ] = potential_count
 
-            elif potential_status == "Undersized":
+            elif potential_status in {
+                "Undersized",
+                "No Assigned Addresses",
+            }:
                 balancing_rows.append(
                     {
                         "Territory": territory_name,
@@ -2025,7 +2714,7 @@ def generate_excel_report(
 
         for territory_name in sorted(
             unresolved_undersized,
-            key=natural_keys,
+            key=lambda name: territory_rank.get(name, float("inf")),
         ):
             if (
                 territory_name not in terr_geoms_metric.index
@@ -2281,18 +2970,11 @@ def generate_excel_report(
                     )
                 )
             )
-            originating_order = sorted(
-                territory_balancing_df["Territory"].astype(str).unique(),
-                key=natural_keys,
-            )
-            originating_rank = {
-                territory_name: rank
-                for rank, territory_name in enumerate(originating_order)
-            }
             territory_balancing_df["_Originating_Sort"] = (
                 territory_balancing_df["Territory"]
                 .astype(str)
-                .map(originating_rank)
+                .map(territory_rank)
+                .fillna(float("inf"))
             )
             territory_balancing_df = (
                 territory_balancing_df.sort_values(
@@ -2525,18 +3207,11 @@ def generate_excel_report(
             audit_gdf["Unit_Sort"] = (
                 audit_gdf["Canonical_Unit"].map(clean_field).str.upper()
             )
-            audit_territory_order = sorted(
-                audit_gdf["Territory_Name"].astype(str).unique(),
-                key=natural_keys,
-            )
-            audit_territory_rank = {
-                territory_name: rank
-                for rank, territory_name in enumerate(audit_territory_order)
-            }
             audit_gdf["_Territory_Natural_Sort"] = (
                 audit_gdf["Territory_Name"]
                 .astype(str)
-                .map(audit_territory_rank)
+                .map(territory_rank)
+                .fillna(float("inf"))
             )
             audit_gdf = (
                 audit_gdf.sort_values(
@@ -2704,9 +3379,132 @@ def generate_excel_report(
                     coordinate_cell.value = float(coordinate_cell.value)
                     coordinate_cell.number_format = "0.################"
 
+        # --- TAB 7: OVERLAP AUDIT ---
+        overlap_columns = [
+            "Address",
+            "Assigned Territory",
+            "Additional Territory",
+            "Assigned Group",
+            "Additional Group",
+            "Overlap Type",
+            "Resolution",
+            "Source Record ID",
+        ]
+        if valid_overlap_audit_df.empty:
+            overlap_export_df = pd.DataFrame(columns=overlap_columns)
+        else:
+            overlap_export_df = valid_overlap_audit_df.copy()
+            overlap_export_df["_Assigned_Order"] = (
+                overlap_export_df["Assigned_Territory"]
+                .map(territory_rank)
+                .fillna(float("inf"))
+            )
+            overlap_export_df["_Additional_Order"] = (
+                overlap_export_df["Additional_Territory"]
+                .map(territory_rank)
+                .fillna(float("inf"))
+            )
+            overlap_export_df = (
+                overlap_export_df.sort_values(
+                    by=[
+                        "_Assigned_Order",
+                        "_Additional_Order",
+                        "Address",
+                        "Source_Record_ID",
+                        "Overlap_Type",
+                    ],
+                    kind="stable",
+                )
+                .rename(
+                    columns={
+                        "Assigned_Territory": "Assigned Territory",
+                        "Additional_Territory": "Additional Territory",
+                        "Assigned_Group": "Assigned Group",
+                        "Additional_Group": "Additional Group",
+                        "Overlap_Type": "Overlap Type",
+                        "Source_Record_ID": "Source Record ID",
+                    }
+                )[overlap_columns]
+                .reset_index(drop=True)
+            )
+
+        overlap_export_df.to_excel(
+            writer,
+            sheet_name="Overlap Audit",
+            index=False,
+        )
+        ws7 = writer.sheets["Overlap Audit"]
+        ws7.freeze_panes = "A2"
+
+        overlap_widths = {
+            "A": 57,
+            "B": 22,
+            "C": 22,
+            "D": 18,
+            "E": 18,
+            "F": 30,
+            "G": 90,
+            "H": 36,
+        }
+        for column_letter, width in overlap_widths.items():
+            ws7.column_dimensions[column_letter].width = width
+
+        for cell in ws7[1]:
+            cell.fill = excluded_header_fill
+            cell.font = Font(bold=True, color="EAECEB", size=12)
+            cell.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=True,
+            )
+            cell.border = excluded_border
+
+        same_group_audit_fill = PatternFill(
+            start_color="FFF2CC",
+            end_color="FFF2CC",
+            fill_type="solid",
+        )
+        for row_number in range(2, len(overlap_export_df) + 2):
+            row_fill = (
+                excluded_white_fill
+                if row_number % 2 == 0
+                else excluded_stripe_fill
+            )
+            overlap_type = ws7.cell(row=row_number, column=6).value
+            if overlap_type == "Same-Group Review":
+                row_fill = same_group_audit_fill
+
+            for column_number in range(1, 9):
+                cell = ws7.cell(row=row_number, column=column_number)
+                cell.fill = row_fill
+                cell.border = excluded_border
+                cell.alignment = Alignment(
+                    horizontal=(
+                        "left" if column_number in {1, 2, 3, 6, 7, 8}
+                        else "center"
+                    ),
+                    vertical="center",
+                    wrap_text=column_number in {1, 2, 3, 6, 7},
+                )
+
+        if not overlap_export_df.empty:
+            overlap_table = Table(
+                displayName="OverlapAuditTable",
+                ref=f"A1:H{len(overlap_export_df) + 1}",
+            )
+            overlap_table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium9",
+                showFirstColumn=False,
+                showLastColumn=False,
+                showRowStripes=False,
+                showColumnStripes=False,
+            )
+            ws7.add_table(overlap_table)
+
         # --- EXCEL UX POLISH ---
         writer.sheets["Territory Balancing"].freeze_panes = "E2"
         writer.sheets["Excluded Audit"].freeze_panes = "A2"
+        writer.sheets["Overlap Audit"].freeze_panes = "A2"
 
         writer.sheets["Dashboard"].sheet_properties.tabColor = "1E90FF"
         writer.sheets["Counts"].sheet_properties.tabColor = "32CD32"
@@ -2714,6 +3512,7 @@ def generate_excel_report(
         writer.sheets["Apartments"].sheet_properties.tabColor = "FF8C00"
         writer.sheets["Territory Balancing"].sheet_properties.tabColor = "FF0000"
         writer.sheets["Excluded Audit"].sheet_properties.tabColor = "808080"
+        writer.sheets["Overlap Audit"].sheet_properties.tabColor = "808080"
 
     output.seek(0)
     return output
@@ -2721,11 +3520,18 @@ def generate_excel_report(
 # --- 4. EXECUTION FLOW ---
 if "last_uploaded_kml" not in st.session_state:
     st.session_state["last_uploaded_kml"] = None
+if "last_group_signature" not in st.session_state:
+    st.session_state["last_group_signature"] = None
 
-if uploaded_kml != st.session_state["last_uploaded_kml"]:
+inputs_changed = (
+    uploaded_kml != st.session_state["last_uploaded_kml"]
+    or group_signature != st.session_state["last_group_signature"]
+)
+if inputs_changed:
     if "excel_data" in st.session_state:
         del st.session_state["excel_data"]
     st.session_state["last_uploaded_kml"] = uploaded_kml
+    st.session_state["last_group_signature"] = group_signature
 
 if uploaded_kml and "excel_data" not in st.session_state:
     if st.button("Generate Territory Analysis"):
@@ -2767,20 +3573,35 @@ if uploaded_kml and "excel_data" not in st.session_state:
             status_placeholder.info("Analysis engine makes a return visit…")
 
             try:
-                kml_gdf = gpd.read_file(uploaded_kml, driver="KML")
-                if kml_gdf.crs is None: kml_gdf = kml_gdf.set_crs("EPSG:4326", allow_override=True)
-                if parcel_gdf.crs is None: raise ValueError("The parcel dataset has no CRS. Assign the correct source CRS before processing.")
+                kml_gdf = gpd.read_file(
+                    io.BytesIO(uploaded_kml.getvalue()),
+                    driver="KML",
+                )
+                if kml_gdf.crs is None:
+                    kml_gdf = kml_gdf.set_crs(
+                        "EPSG:4326",
+                        allow_override=True,
+                    )
+                if parcel_gdf.crs is None:
+                    raise ValueError(
+                        "The parcel dataset has no CRS. Assign the correct "
+                        "source CRS before processing."
+                    )
 
                 kml_gdf = kml_gdf.copy()
                 kml_gdf["geometry"] = kml_gdf.geometry.make_valid()
-                kml_gdf = kml_gdf[kml_gdf.geometry.notna() & ~kml_gdf.geometry.is_empty].copy()
+                kml_gdf = kml_gdf[
+                    kml_gdf.geometry.notna()
+                    & ~kml_gdf.geometry.is_empty
+                ].copy()
+                kml_gdf = assign_territory_names(kml_gdf)
+                kml_gdf = apply_territory_groups(
+                    kml_gdf,
+                    territory_group_overrides,
+                )
 
-                fallback_names = "Territory_" + kml_gdf.index.to_series().astype(str)
-                if "Name" in kml_gdf.columns: kml_gdf["Territory_Name"] = kml_gdf["Name"].replace(r"^\s*$", pd.NA, regex=True).fillna(fallback_names)
-                elif "Description" in kml_gdf.columns: kml_gdf["Territory_Name"] = kml_gdf["Description"].replace(r"^\s*$", pd.NA, regex=True).fillna(fallback_names)
-                else: kml_gdf["Territory_Name"] = fallback_names
-
-                if parcel_gdf.crs != kml_gdf.crs: parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
+                if parcel_gdf.crs != kml_gdf.crs:
+                    parcel_gdf = parcel_gdf.to_crs(kml_gdf.crs)
 
                 parcel_gdf = parcel_gdf.copy()
                 parcel_gdf["geometry"] = parcel_gdf.geometry.make_valid()
@@ -2795,7 +3616,13 @@ if uploaded_kml and "excel_data" not in st.session_state:
 
                 joined_gdf = gpd.sjoin(
                     parcel_join_gdf,
-                    kml_gdf[["Territory_Name", "geometry_terr"]],
+                    kml_gdf[
+                        [
+                            "Territory_Name",
+                            "Territory_Group",
+                            "geometry_terr",
+                        ]
+                    ],
                     how="inner",
                     predicate="covered_by",
                 )
@@ -2812,19 +3639,36 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 ].copy()
                 unassigned_address_count = len(unassigned_gdf)
 
-                joined_gdf["_Territory_Sort"] = joined_gdf["Territory_Name"].astype(str).str.upper()
-                joined_gdf = joined_gdf.sort_values(by=["Source_Record_ID", "_Territory_Sort"], kind="stable")
                 status_placeholder.info("Analysis engine stamps a letter…")
+                territory_order, territory_rank = build_territory_order(
+                    kml_gdf
+                )
+                joined_gdf, overlap_audit_df, overlap_match_count = (
+                    resolve_overlapping_assignments(
+                        joined_gdf,
+                        kml_gdf,
+                        county_config["metric_crs"],
+                        territory_rank,
+                    )
+                )
 
-                duplicate_assignment_count = joined_gdf.duplicated(subset=["Source_Record_ID"], keep="first").sum()
-                joined_gdf = joined_gdf.drop_duplicates(subset=["Source_Record_ID"], keep="first").copy()
-                
-                joined_gdf = joined_gdf.drop(columns=["_Territory_Sort"], errors="ignore")
-                joined_gdf = joined_gdf.set_geometry("geometry")
-                joined_gdf = joined_gdf.drop(columns=["_join_point", "index_right"], errors="ignore")
-
-                if duplicate_assignment_count > 0:
-                    st.warning(f"{duplicate_assignment_count:,} duplicate boundary assignment(s) were resolved by retaining the first territory match for each Source_Record_ID.")
+                if overlap_match_count > 0:
+                    same_group_count = 0
+                    if not overlap_audit_df.empty:
+                        same_group_count = overlap_audit_df.loc[
+                            overlap_audit_df["Overlap_Type"].eq(
+                                "Same-Group Review"
+                            ),
+                            "Source_Record_ID",
+                        ].nunique()
+                    st.warning(
+                        f"The uploaded map produced {overlap_match_count:,} "
+                        "overlapping address-to-territory match(es). "
+                        "Cross-group assignments were retained. "
+                        f"{same_group_count:,} same-group address conflict(s) "
+                        "were assigned once and added to the Overlap Audit "
+                        "for review."
+                    )
 
                 status_placeholder.info(random.choice([
                     "Analysis engine stops for coffee…",
@@ -2836,6 +3680,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 excel_file = generate_excel_report(
                     joined_gdf,
                     unassigned_gdf,
+                    overlap_audit_df,
                     kml_gdf,
                     MIN_GOAL,
                     MAX_GOAL,
@@ -2845,7 +3690,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
                     selected_excluded_statuses=selected_excluded_statuses,
                     kml_filename=uploaded_kml.name,
                     county_filename=county_config["file_path"],
-                    duplicate_assignment_count=duplicate_assignment_count,
+                    overlap_match_count=overlap_match_count,
                     unassigned_address_count=unassigned_address_count,
                 )
                 
