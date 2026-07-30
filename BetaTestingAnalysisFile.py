@@ -24,8 +24,13 @@ COUNTY_CONFIGS = {
         "metric_crs": "EPSG:3071",
         "native_source_id": "TAXKEY",
         "excluded_statuses": [
-            "Undeveloped", "Parking Lot", "ROW", "Park or Recreational Facility",
-            "Undeveloped Outlot", "Sliver or Remnant", "Non Addressable Assoc with Adj Parcel",
+            "Undeveloped",
+            "Parking Lot",
+            "ROW",
+            "Park or Recreational Facility",
+            "Undeveloped Outlot",
+            "Sliver or Remnant",
+            "Non Addressable Assoc with Adj Parcel",
         ],
         "column_mapping": {
             "TAXKEY": "Canonical_Native_Source_ID",
@@ -39,7 +44,33 @@ COUNTY_CONFIGS = {
             "Unit": "Canonical_Unit",
             "Addr_Statu": "Canonical_Status",
         },
-    }
+    },
+    "Waukesha": {
+        "file_path": "zip://data/WAUKESHA_Shape_Address.zip",
+        "state": "WI",
+        "metric_crs": "EPSG:3071",
+        "native_source_id": "point_id",
+        "excluded_statuses": [
+            "Other",
+            "Utility Asset",
+            "Parcel",
+        ],
+        "column_mapping": {
+            "point_id": "Canonical_Native_Source_ID",
+            "site_numbe": "Canonical_HouseNo",
+            "addnum_suf": "Canonical_HouseSx",
+            "legprefixd": "Canonical_Dir",
+            "legroadnam": "Canonical_Street",
+            "legroadtyp": "Canonical_StType",
+            "legsuffixd": "Canonical_SuffixDir",
+            "post_comm": "Canonical_Muni",
+            "post_code": "Canonical_Zip_Code",
+            "unittype": "Canonical_UnitType",
+            "unitnumber": "Canonical_Unit",
+            "pointtype": "Canonical_Status",
+            "full_addre": "Canonical_Full_Address",
+        },
+    },
 }
 
 REQUIRED_CANONICAL_COLUMNS = [
@@ -121,82 +152,191 @@ def normalize_zip_code(value):
     if len(digits) > 9: return f"{digits[:5]}-{digits[5:9]}"
     return digits
 
-def normalize_unit(value):
+def normalize_unit(value, unit_type=None):
     text = clean_field(value)
-    if not text: return ""
-    if re.fullmatch(r"\d+\.0+", text): text = text.split(".", 1)[0]
+    explicit_type = clean_field(unit_type)
+
+    if text and re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+
     text = re.sub(r"\s+", " ", text).strip()
-    descriptive_pattern = re.compile(r"^(?:apt(?:artment)?|unit|ste|suite|upper|lower|bsmt|basement|rear|front|floor|fl|building|bldg|room|rm)\b", flags=re.IGNORECASE)
-    if descriptive_pattern.search(text): return text
-    return f"Apt {text}"
+    explicit_type = re.sub(r"\s+", " ", explicit_type).strip()
+
+    if explicit_type:
+        if not text:
+            return explicit_type
+        if re.match(rf"^{re.escape(explicit_type)}\b", text, re.IGNORECASE):
+            return text
+        return f"{explicit_type} {text}"
+
+    if not text:
+        return ""
+
+    descriptive_pattern = re.compile(
+        r"^(?:apt(?:artment)?|unit|ste|suite|upper|lower|bsmt|basement|"
+        r"rear|front|floor|fl|building|bldg|room|rm)\b",
+        re.IGNORECASE,
+    )
+    return text if descriptive_pattern.search(text) else f"Apt {text}"
+
+
+def combine_house_number(row):
+    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    suffix = clean_field(row.get("Canonical_HouseSx"))
+
+    if not house or not suffix or house.upper().endswith(suffix.upper()):
+        return house
+
+    return f"{house}{suffix}"
+
+
+def build_canonical_street(row):
+    fields = [
+        row.get("Canonical_Dir"),
+        row.get("Canonical_Street"),
+        row.get("Canonical_StType"),
+        row.get("Canonical_SuffixDir"),
+    ]
+    return " ".join(clean_field(value) for value in fields if clean_field(value))
+
+
+def normalize_full_address(value):
+    text = clean_field(value)
+    if not text:
+        return ""
+
+    text = re.sub(r"\s+", " ", text)
+    return re.sub(r"\s*,\s*", ", ", text).strip(" ,")
+
+
+def is_usable_full_address(value):
+    street_line = normalize_full_address(value).split(",", 1)[0].strip()
+    tokens = street_line.split()
+
+    if len(tokens) < 2:
+        return False
+
+    return bool(re.search(r"\d", tokens[0])) and bool(
+        re.search(r"[A-Za-z]", " ".join(tokens[1:]))
+    )
+
 
 def house_number_sort_parts(value):
     text = normalize_house_number(value).upper()
-    if not text: return pd.Series([float("inf"), 9, ""])
+    if not text:
+        return pd.Series([float("inf"), 9, ""])
+
     compact = re.sub(r"\s+", " ", text).strip()
-    mixed_fraction = re.match(r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$", compact)
+    grid_match = re.fullmatch(
+        r"([NSEW])(\d+)([NSEW])(\d+)([A-Z]?)",
+        compact,
+    )
+    if grid_match:
+        first_dir, first_num, second_dir, number, suffix = grid_match.groups()
+        text_sort = f"{first_dir}{int(first_num):06d}{second_dir}{suffix}"
+        return pd.Series([float(number), 3, text_sort])
+
+    mixed_fraction = re.match(
+        r"^(\d+)\s+(\d+)\s*/\s*(\d+)(.*)$",
+        compact,
+    )
     if mixed_fraction:
         whole, numerator, denominator, suffix = mixed_fraction.groups()
-        try: numeric_value = int(whole) + float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError): numeric_value = float(int(whole))
+        try:
+            numeric_value = int(whole) + float(
+                Fraction(int(numerator), int(denominator))
+            )
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float(int(whole))
         return pd.Series([numeric_value, 1, suffix.strip()])
+
     simple_fraction = re.match(r"^(\d+)\s*/\s*(\d+)(.*)$", compact)
     if simple_fraction:
         numerator, denominator, suffix = simple_fraction.groups()
-        try: numeric_value = float(Fraction(int(numerator), int(denominator)))
-        except (ValueError, ZeroDivisionError): numeric_value = float("inf")
+        try:
+            numeric_value = float(Fraction(int(numerator), int(denominator)))
+        except (ValueError, ZeroDivisionError):
+            numeric_value = float("inf")
         return pd.Series([numeric_value, 1, suffix.strip()])
+
     numeric_prefix = re.match(r"^(\d+(?:\.\d+)?)(.*)$", compact)
     if numeric_prefix:
         number, suffix = numeric_prefix.groups()
-        return pd.Series([float(number), 0 if not suffix.strip() else 2, suffix.strip()])
+        suffix_rank = 0 if not suffix.strip() else 2
+        return pd.Series([float(number), suffix_rank, suffix.strip()])
+
     return pd.Series([float("inf"), 8, compact])
 
+
 def build_addresses(row, state):
-    house = normalize_house_number(row.get("Canonical_HouseNo"))
-    house_sx = clean_field(row.get("Canonical_HouseSx"))
-    direction = clean_field(row.get("Canonical_Dir"))
-    street = clean_field(row.get("Canonical_Street"))
-    st_type = clean_field(row.get("Canonical_StType"))
-    muni = clean_field(row.get("Canonical_Muni"))
+    full_house_number = combine_house_number(row)
+    full_street = build_canonical_street(row)
+    parsed_is_usable = bool(
+        full_house_number and clean_field(row.get("Canonical_Street"))
+    )
+
+    fallback = normalize_full_address(row.get("Canonical_Full_Address"))
+    fallback_line = fallback.split(",", 1)[0].strip()
+    if parsed_is_usable:
+        base_line = " ".join([full_house_number, full_street]).strip()
+    elif fallback_line:
+        base_line = fallback_line
+    else:
+        base_line = " ".join([full_house_number, full_street]).strip()
+
+    municipality = clean_field(row.get("Canonical_Muni"))
     normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
-    zip_c = normalized_zip[:5] if normalized_zip else ""
-    unit_str = normalize_unit(row.get("Canonical_Unit"))
+    zip_code = normalized_zip[:5] if normalized_zip else ""
+    locality = ", ".join(part for part in [municipality, state] if part)
+    if zip_code:
+        locality = f"{locality} {zip_code}".strip()
 
-    full_house_num = f"{house}{house_sx}".strip()
-    full_street = " ".join(part for part in [direction, street, st_type] if part)
-    base_addr_line = " ".join(part for part in [full_house_num, full_street] if part)
-    locality = ", ".join(part for part in [muni, state] if part)
-    if zip_c: locality = f"{locality} {zip_c}".strip()
+    unit = normalize_unit(
+        row.get("Canonical_Unit"),
+        row.get("Canonical_UnitType"),
+    )
+    mailable_line = " ".join(part for part in [base_line, unit] if part)
+    base_address = ", ".join(part for part in [base_line, locality] if part)
+    mailable_address = ", ".join(
+        part for part in [mailable_line, locality] if part
+    )
 
-    base_addr = ", ".join(part for part in [base_addr_line, locality] if part)
-    mailable_addr = ", ".join(part for part in [" ".join([base_addr_line, unit_str]).strip(), locality] if part)
+    return pd.Series(
+        [base_address, mailable_address],
+        index=["Base_Address", "Mailable_Address"],
+    )
 
-    return pd.Series([base_addr, mailable_addr], index=["Base_Address", "Mailable_Address"])
 
 def evaluate_data_quality(row):
     issues = []
-    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    full_house_number = combine_house_number(row)
     street = clean_field(row.get("Canonical_Street"))
     municipality = clean_field(row.get("Canonical_Muni"))
     zip_code = normalize_zip_code(row.get("Canonical_Zip_Code"))
     base_address = clean_field(row.get("Base_Address"))
     mailable_address = clean_field(row.get("Mailable_Address"))
+    fallback = normalize_full_address(row.get("Canonical_Full_Address"))
 
-    if not street:
+    parsed_is_usable = bool(full_house_number and street)
+    fallback_is_usable = is_usable_full_address(fallback)
+
+    if not street and not fallback_is_usable:
         issues.append("Missing Street")
     if not municipality:
         issues.append("Missing Municipality")
     if not zip_code:
         issues.append("Missing ZIP")
-    if house and re.fullmatch(r"[+-]?0+(?:\.0+)?", house):
+    if full_house_number and re.fullmatch(
+        r"[+-]?0+(?:\.0+)?",
+        full_house_number,
+    ):
         issues.append("Zero House Number")
 
     zip_is_valid = not zip_code or bool(
         re.fullmatch(r"\d{5}(?:-\d{4})?", zip_code)
     )
     if (
-        not house
+        not (parsed_is_usable or fallback_is_usable)
         or not base_address
         or not mailable_address
         or ",," in base_address
@@ -204,6 +344,11 @@ def evaluate_data_quality(row):
         or not zip_is_valid
     ):
         issues.append("Malformed Address")
+
+    if not parsed_is_usable and fallback_is_usable:
+        issues.append("Full Address Fallback Used")
+    elif fallback and not parsed_is_usable:
+        issues.append("Unusable Full Address Fallback")
 
     return " | ".join(issues)
 
@@ -214,39 +359,40 @@ def parse_house_number_components(full_house_number):
         return "", "", ""
 
     text = re.sub(r"\s+", " ", text).strip()
-    directional_prefix = ""
-    house_number_main = ""
-    house_suffix = ""
+    grid_match = re.fullmatch(
+        r"([NSEW]\d+[NSEW])(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
+        text,
+    )
+    if grid_match:
+        return grid_match.groups()
 
     directional_match = re.fullmatch(
         r"([NSEW])\s*(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
         text,
     )
     if directional_match:
-        directional_prefix, house_number_main, house_suffix = (
-            directional_match.groups()
-        )
-        return directional_prefix, house_number_main, house_suffix
+        return directional_match.groups()
 
     standard_match = re.fullmatch(
         r"(\d+(?:\s+\d+/\d+|\.\d+)?)([A-Z]?)",
         text,
     )
     if standard_match:
-        house_number_main, house_suffix = standard_match.groups()
-        return "", house_number_main, house_suffix
+        house_main, suffix = standard_match.groups()
+        return "", house_main, suffix
 
-    numeric_match = re.search(r"\d+(?:\s+\d+/\d+|\.\d+)?", text)
-    if numeric_match:
-        house_number_main = numeric_match.group(0)
-        prefix_text = text[:numeric_match.start()].strip()
-        suffix_text = text[numeric_match.end():].strip()
-        if prefix_text in {"N", "S", "E", "W"}:
-            directional_prefix = prefix_text
-        if re.fullmatch(r"[A-Z]", suffix_text):
-            house_suffix = suffix_text
+    numeric_matches = list(
+        re.finditer(r"\d+(?:\s+\d+/\d+|\.\d+)?", text)
+    )
+    if not numeric_matches:
+        return "", "", ""
 
-    return directional_prefix, house_number_main, house_suffix
+    numeric_match = numeric_matches[-1]
+    prefix = text[:numeric_match.start()].strip()
+    suffix = text[numeric_match.end():].strip()
+    prefix = prefix if re.fullmatch(r"[NSEW](?:\d+[NSEW])?", prefix) else ""
+    suffix = suffix if re.fullmatch(r"[A-Z]", suffix) else ""
+    return prefix, numeric_match.group(0), suffix
 
 
 def parse_mailable_address(row, state):
@@ -264,31 +410,29 @@ def parse_mailable_address(row, state):
     state_value = state
     normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
     zip_code = normalized_zip[:5] if normalized_zip else ""
-    zip4_code = (
-        normalized_zip.split("-", 1)[1]
-        if "-" in normalized_zip
-        else ""
-    )
+    zip4_code = normalized_zip.split("-", 1)[1] if "-" in normalized_zip else ""
     state_zip_match = re.fullmatch(
         r"([A-Za-z]{2})(?:\s+(\d{5})(?:-(\d{4}))?)?",
         state_zip,
     )
     if state_zip_match:
         state_value = state_zip_match.group(1).upper()
-        if state_zip_match.group(2):
-            zip_code = state_zip_match.group(2)
-        if state_zip_match.group(3):
-            zip4_code = state_zip_match.group(3)
+        zip_code = state_zip_match.group(2) or zip_code
+        zip4_code = state_zip_match.group(3) or zip4_code
 
     unit_type = ""
     unit_value = clean_field(row.get("Canonical_Unit"))
-    normalized_unit = normalize_unit(unit_value)
+    normalized_unit = normalize_unit(
+        unit_value,
+        row.get("Canonical_UnitType"),
+    )
     if normalized_unit:
         unit_match = re.match(
-            r"^(APT(?:ARTMENT)?|UNIT|STE|SUITE|UPPER|LOWER|BSMT|BASEMENT|"
-            r"REAR|FRONT|FLOOR|FL|BUILDING|BLDG|ROOM|RM)\b\s*(.*)$",
+            r"^(APT(?:ARTMENT)?|UNIT|STE|SUITE|UPPER|LOWER|BSMT|"
+            r"BASEMENT|REAR|FRONT|FLOOR|FL|BUILDING|BLDG|ROOM|RM|"
+            r"TRLR|TRAILER|LOT|PH|PENTHOUSE|OFFICE)\b\s*(.*)$",
             normalized_unit,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
         if unit_match:
             unit_type = unit_match.group(1).upper()
@@ -298,16 +442,13 @@ def parse_mailable_address(row, state):
 
     street_without_unit = street_line
     if normalized_unit:
-        unit_suffix_pattern = re.compile(
+        unit_pattern = re.compile(
             rf"\s+{re.escape(normalized_unit)}$",
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
-        street_without_unit = unit_suffix_pattern.sub("", street_line).strip()
+        street_without_unit = unit_pattern.sub("", street_line).strip()
 
-    full_house_number = (
-        f"{normalize_house_number(row.get('Canonical_HouseNo'))}"
-        f"{clean_field(row.get('Canonical_HouseSx'))}"
-    ).strip()
+    full_house_number = combine_house_number(row)
     if not full_house_number:
         house_match = re.match(r"^(\S+)\s+(.*)$", street_without_unit)
         if house_match:
@@ -320,31 +461,52 @@ def parse_mailable_address(row, state):
     street_prefix = clean_field(row.get("Canonical_Dir")).upper()
     street_name = clean_field(row.get("Canonical_Street"))
     street_type = clean_field(row.get("Canonical_StType")).upper()
+    suffix_direction = clean_field(
+        row.get("Canonical_SuffixDir")
+    ).upper()
     full_street = " ".join(
-        part for part in [street_prefix, street_name, street_type] if part
+        part
+        for part in [
+            street_prefix,
+            street_name,
+            street_type,
+            suffix_direction,
+        ]
+        if part
     )
 
-    if not full_street and street_without_unit:
+    if not street_name and street_without_unit:
         remaining_street = street_without_unit
         if full_house_number and remaining_street.upper().startswith(
             full_house_number.upper()
         ):
-            remaining_street = remaining_street[len(full_house_number):].strip()
+            remaining_street = remaining_street[
+                len(full_house_number):
+            ].strip()
 
         street_match = re.fullmatch(
             r"(?:(N|S|E|W|NE|NW|SE|SW)\s+)?(.+?)"
-            r"(?:\s+(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|DR|DRIVE|"
-            r"LN|LANE|CT|COURT|PL|PLACE|PKWY|PARKWAY|HWY|HIGHWAY|WAY|TER|"
-            r"TERRACE|CIR|CIRCLE))?",
+            r"(?:\s+(ST|STREET|AVE|AVENUE|RD|ROAD|BLVD|BOULEVARD|"
+            r"DR|DRIVE|LN|LANE|CT|COURT|PL|PLACE|PKWY|PARKWAY|"
+            r"HWY|HIGHWAY|WAY|TER|TERRACE|CIR|CIRCLE))?"
+            r"(?:\s+(N|S|E|W|NE|NW|SE|SW))?",
             remaining_street,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
         if street_match:
             street_prefix = clean_field(street_match.group(1)).upper()
             street_name = clean_field(street_match.group(2))
             street_type = clean_field(street_match.group(3)).upper()
+            suffix_direction = clean_field(street_match.group(4)).upper()
             full_street = " ".join(
-                part for part in [street_prefix, street_name, street_type] if part
+                part
+                for part in [
+                    street_prefix,
+                    street_name,
+                    street_type,
+                    suffix_direction,
+                ]
+                if part
             )
 
     return pd.Series(
