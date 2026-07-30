@@ -401,8 +401,49 @@ def resolve_overlapping_assignments(
     return selected_matches, overlap_audit_df, overlap_match_count
 
 
+def show_loading_status(placeholder, message):
+    """Display a processing message with a small animated loading wheel."""
+    placeholder.markdown(
+        f"""
+        <div class="territory-loading-row">
+            <span class="territory-loading-wheel"></span>
+            <span>{message}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # --- 1. CONFIGURATION & UI SETUP ---
 st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .territory-loading-row {
+        display: flex;
+        align-items: center;
+        gap: 0.65rem;
+        padding: 0.75rem 1rem;
+        border-radius: 0.5rem;
+        background: rgba(28, 131, 225, 0.1);
+    }
+    .territory-loading-wheel {
+        width: 1rem;
+        height: 1rem;
+        border: 0.16rem solid rgba(28, 131, 225, 0.25);
+        border-top-color: rgb(28, 131, 225);
+        border-radius: 50%;
+        animation: territory-spin 0.8s linear infinite;
+        flex: 0 0 auto;
+    }
+    @keyframes territory-spin {
+        to { transform: rotate(360deg); }
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.title("TerritoryToolbox's Analysis Engine")
 st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
@@ -2221,8 +2262,7 @@ def generate_excel_report(
         apt_groups["Suggested Action"] = apt_groups["_Action_Code"].map(
             apartment_action_text
         )
-        apt_groups["Excel Link"] = "Link"
-        apt_groups["Sheets Link"] = "Link"
+        apt_groups["Cell on Address List"] = ""
 
         if not apt_groups.empty:
             apt_export = apt_groups.rename(
@@ -2239,8 +2279,7 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
-                    "Excel Link",
-                    "Sheets Link",
+                    "Cell on Address List",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -2260,8 +2299,7 @@ def generate_excel_report(
                     "Total Addresses in Territory",
                     "Current Territory Status",
                     "Suggested Action",
-                    "Excel Link",
-                    "Sheets Link",
+                    "Cell on Address List",
                     "Source Rows",
                     "Nonblank Unit Rows",
                     "Unique Normalized Units",
@@ -2293,23 +2331,22 @@ def generate_excel_report(
             "D": 18,
             "E": 18,
             "F": 107,
-            "G": 8.5,
-            "H": 8.5,
+            "G": 14,
+            "H": 18,
             "I": 18,
             "J": 18,
             "K": 18,
             "L": 18,
             "M": 18,
             "N": 18,
-            "O": 18,
-            "P": 57,
+            "O": 57,
         }
         for column_letter, width in apartment_widths.items():
             ws4.column_dimensions[column_letter].width = width
-        for column_letter in ["I", "J", "K", "L", "M", "N", "O", "P"]:
+        for column_letter in ["H", "I", "J", "K", "L", "M", "N", "O"]:
             ws4.column_dimensions[column_letter].hidden = True
-        ws4.delete_cols(15, 12)
-        apartment_table.ref = f"A1:N{len(apt_export) + 1}"
+        ws4.delete_cols(14, 12)
+        apartment_table.ref = f"A1:M{len(apt_export) + 1}"
 
         header_fill = PatternFill(
             start_color="046A34",
@@ -2368,7 +2405,7 @@ def generate_excel_report(
                 cell.border = apartment_bottom_border
                 cell.alignment = Alignment(
                     horizontal=(
-                        "left" if column_number in {1, 3, 6, 14} else "center"
+                        "left" if column_number in {1, 3, 6, 13} else "center"
                     ),
                     vertical="center",
                     wrap_text=True,
@@ -2382,22 +2419,14 @@ def generate_excel_report(
                 units_cell.value = int(units_cell.value)
 
             address_list_row = address_row_lookup.get(base_address)
-            excel_link_cell = ws4.cell(row=row_number, column=7)
-            sheets_link_cell = ws4.cell(row=row_number, column=8)
+            address_cell_reference = ws4.cell(row=row_number, column=7)
             if address_list_row is not None:
-                excel_link_cell.value = (
-                    f"=HYPERLINK(\"#'Address List'!A{address_list_row}\",\"Link\")"
-                )
-                sheets_link_cell.value = (
-                    f"=HYPERLINK(\"#range='Address List'!A{address_list_row}\",\"Link\")"
-                )
-                for link_cell in [excel_link_cell, sheets_link_cell]:
-                    link_cell.font = Font(color="0563C1", underline="single")
-                    link_cell.alignment = Alignment(
-                        horizontal="center",
-                        vertical="center",
-                        wrap_text=False,
-                    )
+                address_cell_reference.value = f"A{address_list_row}"
+            address_cell_reference.alignment = Alignment(
+                horizontal="center",
+                vertical="center",
+                wrap_text=False,
+            )
 
             action_code = apt_groups.iloc[row_number - 2]["_Action_Code"]
             full_text = apartment_action_text[action_code]
@@ -3599,12 +3628,12 @@ if inputs_changed:
 if uploaded_kml and "excel_data" not in st.session_state:
     if st.button("Generate Territory Analysis"):
         status_placeholder = st.empty()
-        status_placeholder.info("Analysis engine stops for coffee…")
+        show_loading_status(status_placeholder, "Analysis engine stops for coffee…")
         
         parcel_gdf = load_county_data(selected_county)
 
         if parcel_gdf is not None:
-            status_placeholder.info("Analysis engine gets a new call…")
+            show_loading_status(status_placeholder, "Analysis engine gets a new call…")
             
             county_config = COUNTY_CONFIGS[selected_county]
             parcel_gdf = parcel_gdf.reset_index(drop=True).copy()
@@ -3633,7 +3662,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 duplicate_sequence = (parcel_gdf.groupby("Source_Record_ID").cumcount() + 1).astype(str)
                 parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] = parcel_gdf.loc[duplicate_native_ids, "Source_Record_ID"] + "-DUP-" + duplicate_sequence.loc[duplicate_native_ids]
 
-            status_placeholder.info("Analysis engine makes a return visit…")
+            show_loading_status(status_placeholder, "Analysis engine makes a return visit…")
 
             try:
                 kml_gdf = gpd.read_file(
@@ -3702,7 +3731,7 @@ if uploaded_kml and "excel_data" not in st.session_state:
                 ].copy()
                 unassigned_address_count = len(unassigned_gdf)
 
-                status_placeholder.info("Analysis engine stamps a letter…")
+                show_loading_status(status_placeholder, "Analysis engine stamps a letter…")
                 territory_order, territory_rank = build_territory_order(
                     kml_gdf
                 )
@@ -3715,12 +3744,15 @@ if uploaded_kml and "excel_data" not in st.session_state:
                     )
                 )
 
-                status_placeholder.info(random.choice([
-                    "Analysis engine stops for coffee…",
-                    "Analysis engine gets a new call…",
-                    "Analysis engine makes a return visit…",
-                    "Analysis engine stamps a letter…",
-                ]))
+                show_loading_status(
+                    status_placeholder,
+                    random.choice([
+                        "Analysis engine stops for coffee…",
+                        "Analysis engine gets a new call…",
+                        "Analysis engine makes a return visit…",
+                        "Analysis engine stamps a letter…",
+                    ]),
+                )
 
                 excel_file = generate_excel_report(
                     joined_gdf,
@@ -3764,3 +3796,9 @@ if "excel_data" in st.session_state:
         file_name=st.session_state["excel_filename"],
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+st.markdown(
+    "<div style='margin-top: 2rem;'><a href='https://territorytoolbox.com' "
+    "target='_self'>Back to TerritoryToolbox</a></div>",
+    unsafe_allow_html=True,
+)
