@@ -478,6 +478,45 @@ st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide
 st.markdown(
     """
     <style>
+    .block-container {
+        width: 100%;
+        max-width: 980px;
+        margin-left: auto;
+        margin-right: auto;
+        padding-left: 3.5rem;
+        padding-right: 3.5rem;
+        padding-top: 2.5rem;
+    }
+    h1 {
+        text-align: center;
+    }
+    .territory-engine-intro {
+        text-align: center;
+        margin: 0 auto 2rem auto;
+        max-width: 760px;
+    }
+    @media (max-width: 768px) {
+        .block-container {
+            max-width: 100%;
+            padding-left: 1rem;
+            padding-right: 1rem;
+            padding-top: 1.25rem;
+        }
+        h1 {
+            font-size: 2rem !important;
+            line-height: 1.15 !important;
+        }
+        .territory-engine-intro {
+            margin-bottom: 1.5rem;
+        }
+        .territory-loading-messages {
+            min-width: 0 !important;
+            width: 100%;
+        }
+        .territory-loading-message {
+            white-space: normal !important;
+        }
+    }
     .territory-loading-row {
         display: flex;
         align-items: center;
@@ -513,31 +552,35 @@ st.markdown(
     .territory-loading-message-2 { animation-delay: 10s; }
     .territory-loading-message-3 { animation-delay: 15s; }
     .territory-guidance {
-        padding: 0.65rem 0.8rem;
+        padding: 0.8rem 0.9rem;
         border: 1px solid color-mix(in srgb, var(--text-color) 18%, transparent);
         border-radius: 0.4rem;
         background: var(--secondary-background-color);
         color: var(--text-color);
         font-size: 0.9rem;
-        line-height: 1.45;
+        line-height: 1.5;
     }
+    .territory-guidance p {
+        margin: 0;
+    }
+    .territory-guidance p + p {
+        margin-top: 0.75rem;
+    }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"],
+    .stMultiSelect [data-baseweb="tag"],
     div[data-baseweb="tag"] {
-        background-color: color-mix(
-            in srgb,
-            var(--text-color) 18%,
-            var(--secondary-background-color)
-        ) !important;
-        color: var(--text-color) !important;
-        border-color: color-mix(
-            in srgb,
-            var(--text-color) 24%,
-            transparent
-        ) !important;
+        background-color: #6B7280 !important;
+        border-color: #6B7280 !important;
+        color: #FFFFFF !important;
     }
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] span,
+    [data-testid="stMultiSelect"] [data-baseweb="tag"] svg,
+    .stMultiSelect [data-baseweb="tag"] span,
+    .stMultiSelect [data-baseweb="tag"] svg,
     div[data-baseweb="tag"] span,
     div[data-baseweb="tag"] svg {
-        color: var(--text-color) !important;
-        fill: currentColor !important;
+        color: #FFFFFF !important;
+        fill: #FFFFFF !important;
     }
     div[data-testid="stDownloadButton"] button {
         background-color: #0D6B31 !important;
@@ -557,49 +600,50 @@ st.markdown(
 )
 
 st.title("TerritoryToolbox's Analysis Engine")
-st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
+st.markdown(
+    """
+    <div class="territory-engine-intro">
+        Upload your territories KML map to generate a complete, filtered
+        address database &amp; analysis.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 st.header("Step 1: Enter Your Analysis Details")
-step1_col1, step1_col2 = st.columns(2)
-with step1_col1:
-    congregation_name = st.text_input(
-        "Congregation Name (No Spaces)",
-        "ExampleCongregation",
-    )
-with step1_col2:
-    county_options = list(COUNTY_CONFIGS.keys())
-    selected_counties = st.multiselect(
-        "Counties Included in This Analysis",
-        options=county_options,
-        default=county_options[:1],
-    )
-
-goal_col, advanced_col = st.columns(2)
-with goal_col:
-    goal_range = st.selectbox(
-        "Goal # of Addresses Per Territory",
-        ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
-        index=3,
-    )
+congregation_name = st.text_input(
+    "Congregation Name (No Spaces)",
+    "ExampleCongregation",
+)
+county_options = list(COUNTY_CONFIGS.keys())
+selected_counties = st.multiselect(
+    "Counties Included In This Analysis",
+    options=county_options,
+    default=county_options[:1],
+)
+goal_range = st.selectbox(
+    "Goal # of Addresses Per Territory",
+    ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
+    index=3,
+)
 
 selected_excluded_statuses = {}
-with advanced_col:
-    with st.expander("Advanced Settings"):
-        apartment_threshold = st.selectbox(
-            "Apartment Grouping Threshold",
-            [4, 5, 6],
-            index=1,
+with st.expander("Advanced Settings"):
+    apartment_threshold = st.selectbox(
+        "Apartment Grouping Threshold",
+        [4, 5, 6],
+        index=1,
+    )
+    for county_name in selected_counties:
+        county_excluded_statuses = COUNTY_CONFIGS[county_name][
+            "excluded_statuses"
+        ]
+        selected_excluded_statuses[county_name] = st.multiselect(
+            f"{county_name} Excluded Audit Controls",
+            options=county_excluded_statuses,
+            default=county_excluded_statuses,
+            key=f"excluded_audit_controls_{county_name}",
         )
-        for county_name in selected_counties:
-            county_excluded_statuses = COUNTY_CONFIGS[county_name][
-                "excluded_statuses"
-            ]
-            selected_excluded_statuses[county_name] = st.multiselect(
-                f"{county_name} Excluded Audit Controls",
-                options=county_excluded_statuses,
-                default=county_excluded_statuses,
-                key=f"excluded_audit_controls_{county_name}",
-            )
 
 st.header("Step 2: Upload Your Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
@@ -617,10 +661,13 @@ if uploaded_kml:
         st.markdown(
             """
             <div class="territory-guidance">
-                Tip: Analyze your territory types (Residential, Business, Letter
-                Writing) using separate KML files. Combined files are supported,
-                but overlapping maps force the engine to prioritize where shared
-                addresses are assigned.
+                <p><strong>Tip:</strong> It’s best practice to analyze your territory
+                types (door-to-door/residential, business, letter-writing, etc.)
+                using separate KML files.</p>
+                <p>Combined files are supported, but if your maps overlap (ex:
+                business territories physically overlapping with house-to-house
+                territories), the engine will be forced to prioritize where shared
+                addresses are assigned.</p>
             </div>
             """,
             unsafe_allow_html=True,
