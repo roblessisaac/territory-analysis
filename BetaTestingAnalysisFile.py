@@ -12,7 +12,6 @@ import datetime
 import re
 import random
 from fractions import Fraction
-from itertools import combinations
 
 # Enable KML support in GeoPandas yippe!
 fiona.drvsupport.supported_drivers['KML'] = 'rw'
@@ -175,6 +174,22 @@ def build_territory_order(kml_gdf):
     return territory_order, territory_rank
 
 
+def territory_group_priority(territory_group):
+    """Return the cross-group assignment priority for a territory group."""
+    normalized_group = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        clean_field(territory_group).lower(),
+    )
+    if normalized_group.startswith("letterwriting"):
+        return 0
+    if normalized_group.startswith("residential"):
+        return 1
+    if normalized_group.startswith("business"):
+        return 2
+    return 3
+
+
 @st.cache_data
 def inspect_kml_territory_groups(kml_bytes):
     preview_gdf = gpd.read_file(io.BytesIO(kml_bytes), driver="KML")
@@ -191,20 +206,35 @@ def resolve_overlapping_assignments(
     metric_crs,
     territory_rank,
 ):
-    """Keep one assignment per source record and territory group.
+    """Resolve all polygon matches to one final territory per source record.
 
-    Cross-group assignments are retained. Within a single group, the primary
-    territory is the polygon whose internal representative point is nearest to
-    the address point. Natural territory order is the deterministic tie-breaker.
+    Cross-group matches follow this priority: Letter Writing, Residential,
+    Business, then all other groups. If several territories remain inside the
+    winning group, the address is assigned to the territory whose internal
+    representative point is nearest. Natural territory order breaks ties.
+    Every rejected match is retained in the Overlap Audit.
     """
     if joined_gdf.empty:
-        empty_audit = pd.DataFrame()
-        return joined_gdf.copy(), empty_audit, 0
+        return joined_gdf.copy(), pd.DataFrame(), 0
 
     matches = joined_gdf.reset_index(drop=True).copy()
     matches["_Match_ID"] = matches.index
     matches["_Territory_Rank"] = (
         matches["Territory_Name"].map(territory_rank).fillna(float("inf"))
+    )
+    matches["_Group_Priority"] = matches["Territory_Group"].map(
+        territory_group_priority
+    )
+    group_order = sorted(
+        matches["Territory_Group"].map(clean_field).unique(),
+        key=natural_keys,
+    )
+    group_rank = {
+        territory_group: rank
+        for rank, territory_group in enumerate(group_order)
+    }
+    matches["_Group_Rank"] = (
+        matches["Territory_Group"].map(group_rank).fillna(float("inf"))
     )
 
     territory_reference_gdf = (
@@ -233,15 +263,13 @@ def resolve_overlapping_assignments(
     )
     matches["_Assignment_Distance"] = (
         match_points_metric.geometry.distance(reference_points, align=False)
-    )
-    matches["_Assignment_Distance"] = matches[
-        "_Assignment_Distance"
-    ].fillna(float("inf"))
+    ).fillna(float("inf"))
 
     ordered_matches = matches.sort_values(
         by=[
             "Source_Record_ID",
-            "Territory_Group",
+            "_Group_Priority",
+            "_Group_Rank",
             "_Assignment_Distance",
             "_Territory_Rank",
             "_Match_ID",
@@ -249,97 +277,120 @@ def resolve_overlapping_assignments(
         kind="stable",
     )
     selected_matches = ordered_matches.drop_duplicates(
-        subset=["Source_Record_ID", "Territory_Group"],
+        subset=["Source_Record_ID"],
         keep="first",
     ).copy()
 
     source_match_counts = matches.groupby("Source_Record_ID").size()
-    overlapping_source_ids = source_match_counts[
-        source_match_counts > 1
-    ].index
     overlap_match_count = int(
         (source_match_counts[source_match_counts > 1] - 1).sum()
     )
 
-    audit_rows = []
-    overlap_matches = matches[
-        matches["Source_Record_ID"].isin(overlapping_source_ids)
-    ]
-    selected_overlaps = selected_matches[
-        selected_matches["Source_Record_ID"].isin(overlapping_source_ids)
-    ]
-
-    for source_record_id, source_rows in overlap_matches.groupby(
-        "Source_Record_ID",
-        sort=False,
-    ):
-        final_rows = selected_overlaps[
-            selected_overlaps["Source_Record_ID"] == source_record_id
-        ].sort_values(by="_Territory_Rank", kind="stable")
-
-        for (_, assigned_row), (_, additional_row) in combinations(
-            final_rows.iterrows(),
-            2,
-        ):
-            audit_row = assigned_row.to_dict()
-            audit_row.update(
-                {
-                    "Assigned_Territory": assigned_row["Territory_Name"],
-                    "Additional_Territory": additional_row["Territory_Name"],
-                    "Assigned_Group": assigned_row["Territory_Group"],
-                    "Additional_Group": additional_row["Territory_Group"],
-                    "Overlap_Type": "Allowed Cross-Group Overlap",
-                    "Resolution": "Retained in both territories",
-                }
-            )
-            audit_rows.append(audit_row)
-
-        for territory_group, group_rows in source_rows.groupby(
+    additional_info = matches[
+        [
+            "Source_Record_ID",
+            "_Match_ID",
+            "Territory_Name",
             "Territory_Group",
-            sort=False,
-        ):
-            if len(group_rows) <= 1:
-                continue
+            "_Group_Priority",
+        ]
+    ].rename(
+        columns={
+            "_Match_ID": "_Additional_Match_ID",
+            "Territory_Name": "Additional_Territory",
+            "Territory_Group": "Additional_Group",
+            "_Group_Priority": "_Additional_Group_Priority",
+        }
+    )
+    overlap_audit_df = selected_matches.merge(
+        additional_info,
+        on="Source_Record_ID",
+        how="inner",
+    )
+    overlap_audit_df = overlap_audit_df[
+        overlap_audit_df["_Match_ID"]
+        != overlap_audit_df["_Additional_Match_ID"]
+    ].copy()
 
-            primary_row = selected_matches[
-                (selected_matches["Source_Record_ID"] == source_record_id)
-                & (selected_matches["Territory_Group"] == territory_group)
-            ].iloc[0]
-            additional_rows = group_rows[
-                group_rows["_Match_ID"] != primary_row["_Match_ID"]
-            ].sort_values(by="_Territory_Rank", kind="stable")
+    if not overlap_audit_df.empty:
+        overlap_audit_df["Assigned_Territory"] = overlap_audit_df[
+            "Territory_Name"
+        ]
+        overlap_audit_df["Assigned_Group"] = overlap_audit_df[
+            "Territory_Group"
+        ]
+        same_group_mask = overlap_audit_df["Assigned_Group"].eq(
+            overlap_audit_df["Additional_Group"]
+        )
+        overlap_audit_df["Overlap_Type"] = (
+            "Cross-Group Priority Assignment"
+        )
+        overlap_audit_df.loc[
+            same_group_mask,
+            "Overlap_Type",
+        ] = "Same-Group Review"
 
-            for _, additional_row in additional_rows.iterrows():
-                audit_row = primary_row.to_dict()
-                audit_row.update(
-                    {
-                        "Assigned_Territory": primary_row["Territory_Name"],
-                        "Additional_Territory": additional_row[
-                            "Territory_Name"
-                        ],
-                        "Assigned_Group": territory_group,
-                        "Additional_Group": territory_group,
-                        "Overlap_Type": "Same-Group Review",
-                        "Resolution": (
-                            f"Assigned to {primary_row['Territory_Name']} using "
-                            "the nearest territory reference point; "
-                            f"{additional_row['Territory_Name']} requires map "
-                            "review."
-                        ),
-                    }
+        resolution_values = []
+        resolution_fields = overlap_audit_df[
+            [
+                "Assigned_Territory",
+                "Additional_Territory",
+                "Assigned_Group",
+                "Additional_Group",
+                "_Group_Priority",
+                "_Additional_Group_Priority",
+            ]
+        ].itertuples(index=False, name=None)
+        for (
+            assigned_territory,
+            additional_territory,
+            assigned_group,
+            additional_group,
+            assigned_priority,
+            additional_priority,
+        ) in resolution_fields:
+            if assigned_group == additional_group:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory} using the nearest "
+                    "territory reference point; "
+                    f"{additional_territory} requires map review."
                 )
-                audit_rows.append(audit_row)
+            elif assigned_priority < additional_priority:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory}. "
+                    f"{additional_territory} was not counted because "
+                    f"{assigned_group} has higher assignment priority."
+                )
+            else:
+                resolution_values.append(
+                    f"Assigned to {assigned_territory}. "
+                    f"{additional_territory} was not counted because the "
+                    "groups share the same fallback priority and "
+                    f"{assigned_group} won the natural group-order "
+                    "tie-breaker."
+                )
+        overlap_audit_df["Resolution"] = resolution_values
 
-    overlap_audit_df = pd.DataFrame(audit_rows)
-    helper_columns = [
+    audit_helper_columns = [
+        "_Additional_Match_ID",
+        "_Additional_Group_Priority",
+    ]
+    overlap_audit_df = overlap_audit_df.drop(
+        columns=audit_helper_columns,
+        errors="ignore",
+    )
+
+    selected_helper_columns = [
         "_Match_ID",
         "_Territory_Rank",
+        "_Group_Priority",
+        "_Group_Rank",
         "_Assignment_Distance",
         "_join_point",
         "index_right",
     ]
     selected_matches = selected_matches.drop(
-        columns=helper_columns,
+        columns=selected_helper_columns,
         errors="ignore",
     )
     selected_matches = gpd.GeoDataFrame(
@@ -390,9 +441,14 @@ if uploaded_kml:
         )
         st.header("Step 3: Confirm Territory Groups")
         st.caption(
-            f"Detected {detected_territory_count:,} unique territories. "
-            "Addresses may be retained in overlapping territories when the "
-            "territories belong to different groups."
+            f"Detected {detected_territory_count:,} unique territories."
+        )
+        st.info(
+            "For the clearest and most accurate results, consider uploading "
+            "and analyzing separate KML files for different territory "
+            "categories, such as Residential, Business, and Letter Writing. "
+            "Combined KML files are supported, but overlapping categories "
+            "require the analysis engine to apply assignment-priority rules."
         )
         standard_groups = [
             "Residential",
@@ -906,26 +962,6 @@ def generate_excel_report(
         excluded_gdf["Source_Record_ID"].nunique()
     )
 
-    source_group_counts = valid_gdf.groupby("Source_Record_ID")[
-        "Territory_Group"
-    ].nunique()
-    cross_group_shared_source_ids = set(
-        source_group_counts[source_group_counts > 1].index
-    )
-    cross_group_shared_address_count = len(
-        cross_group_shared_source_ids
-    )
-    shared_across_groups_by_territory = (
-        valid_gdf[
-            valid_gdf["Source_Record_ID"].isin(
-                cross_group_shared_source_ids
-            )
-        ]
-        .groupby("Territory_Name")["Source_Record_ID"]
-        .nunique()
-        .to_dict()
-    )
-
     if overlap_audit_df is None or overlap_audit_df.empty:
         valid_overlap_audit_df = pd.DataFrame()
     else:
@@ -956,9 +992,37 @@ def generate_excel_report(
         ]
 
     if valid_overlap_audit_df.empty:
+        cross_group_shared_address_count = 0
+        shared_across_groups_by_territory = {}
         same_group_overlap_address_count = 0
         same_group_overlaps_by_territory = {}
     else:
+        cross_group_audit = valid_overlap_audit_df[
+            valid_overlap_audit_df["Overlap_Type"].eq(
+                "Cross-Group Priority Assignment"
+            )
+        ].copy()
+        cross_group_shared_address_count = int(
+            cross_group_audit["Source_Record_ID"].nunique()
+        )
+        cross_assigned = cross_group_audit[
+            ["Source_Record_ID", "Assigned_Territory"]
+        ].rename(columns={"Assigned_Territory": "Territory_Name"})
+        cross_additional = cross_group_audit[
+            ["Source_Record_ID", "Additional_Territory"]
+        ].rename(columns={"Additional_Territory": "Territory_Name"})
+        cross_group_involvement = pd.concat(
+            [cross_assigned, cross_additional],
+            ignore_index=True,
+        ).drop_duplicates()
+        shared_across_groups_by_territory = (
+            cross_group_involvement.groupby("Territory_Name")[
+                "Source_Record_ID"
+            ]
+            .nunique()
+            .to_dict()
+        )
+
         same_group_audit = valid_overlap_audit_df[
             valid_overlap_audit_df["Overlap_Type"].eq(
                 "Same-Group Review"
@@ -967,14 +1031,14 @@ def generate_excel_report(
         same_group_overlap_address_count = int(
             same_group_audit["Source_Record_ID"].nunique()
         )
-        assigned_involvement = same_group_audit[
+        same_assigned = same_group_audit[
             ["Source_Record_ID", "Assigned_Territory"]
         ].rename(columns={"Assigned_Territory": "Territory_Name"})
-        additional_involvement = same_group_audit[
+        same_additional = same_group_audit[
             ["Source_Record_ID", "Additional_Territory"]
         ].rename(columns={"Additional_Territory": "Territory_Name"})
         same_group_involvement = pd.concat(
-            [assigned_involvement, additional_involvement],
+            [same_assigned, same_additional],
             ignore_index=True,
         ).drop_duplicates()
         same_group_overlaps_by_territory = (
@@ -1306,10 +1370,11 @@ def generate_excel_report(
             (
                 "OVERLAP AUDIT",
                 "The ",
-                " tab displays addresses assigned to multiple territories. "
-                "Cross-group overlaps are retained as valid assignments, while "
-                "conflicting addresses within the same territory group are "
-                "assigned once and flagged for manual review.",
+                " tab displays addresses that matched multiple territories. "
+                "Cross-group matches are assigned using the priority order "
+                "Letter Writing, Residential, Business, then Other. Conflicting "
+                "addresses within the same territory group are assigned once "
+                "and flagged for manual review.",
             ),
         ]
 
@@ -1466,13 +1531,13 @@ def generate_excel_report(
             column=1,
             value=(
                 f"The total territory assignment count is "
-                f"{territory_assignment_count:,}. If this differs from the "
-                "‘Total Valid Addresses’ figure, the uploaded map contains "
-                "overlapping territory types. It is normal for addresses to "
-                "appear in multiple territories across different groups, such "
-                "as Residential and Business. However, same-group overlaps are "
-                "assigned only once and flagged for review. Addresses listed in "
-                "the Overlap Audit may indicate an error in your maps."
+                f"{territory_assignment_count:,}. Each physical address is "
+                "assigned to one final territory using this priority order: "
+                "Letter Writing, Residential, Business, then Other. When an "
+                "address matches multiple territories in the winning group, "
+                "it is assigned once using the nearest territory reference "
+                "point. All competing matches are documented in the Overlap "
+                "Audit."
             ),
         )
         assignment_note.alignment = Alignment(
@@ -1604,13 +1669,22 @@ def generate_excel_report(
                 and same_group_count / territory_count >= 0.10
             )
 
-            if same_group_count and high_overlap:
-                return "High-overlap territory — review recommended"
+            if same_group_count and shared_count:
+                if high_overlap:
+                    return (
+                        f"Review {same_group_count} same-group overlap(s); "
+                        f"{shared_count} cross-group priority assignment(s)"
+                    )
+                return (
+                    f"{same_group_count} same-group overlap(s) and "
+                    f"{shared_count} cross-group assignment(s)"
+                )
             if same_group_count:
-                suffix = "overlap" if same_group_count == 1 else "overlaps"
-                return f"Review {same_group_count} same-group {suffix}"
+                if high_overlap:
+                    return "High-overlap territory — review recommended"
+                return f"Review {same_group_count} same-group overlap(s)"
             if shared_count:
-                return "Cross-group overlap only"
+                return f"{shared_count} cross-group priority assignment(s)"
             return "No overlap detected"
 
         counts_df_sorted["Overlap Review"] = counts_df_sorted.apply(
@@ -3487,19 +3561,8 @@ def generate_excel_report(
                     wrap_text=column_number in {1, 2, 3, 6, 7},
                 )
 
-        if not overlap_export_df.empty:
-            overlap_table = Table(
-                displayName="OverlapAuditTable",
-                ref=f"A1:H{len(overlap_export_df) + 1}",
-            )
-            overlap_table.tableStyleInfo = TableStyleInfo(
-                name="TableStyleMedium9",
-                showFirstColumn=False,
-                showLastColumn=False,
-                showRowStripes=False,
-                showColumnStripes=False,
-            )
-            ws7.add_table(overlap_table)
+        filter_end_row = max(len(overlap_export_df) + 1, 1)
+        ws7.auto_filter.ref = f"A1:H{filter_end_row}"
 
         # --- EXCEL UX POLISH ---
         writer.sheets["Territory Balancing"].freeze_panes = "E2"
@@ -3651,24 +3714,6 @@ if uploaded_kml and "excel_data" not in st.session_state:
                         territory_rank,
                     )
                 )
-
-                if overlap_match_count > 0:
-                    same_group_count = 0
-                    if not overlap_audit_df.empty:
-                        same_group_count = overlap_audit_df.loc[
-                            overlap_audit_df["Overlap_Type"].eq(
-                                "Same-Group Review"
-                            ),
-                            "Source_Record_ID",
-                        ].nunique()
-                    st.warning(
-                        f"The uploaded map produced {overlap_match_count:,} "
-                        "overlapping address-to-territory match(es). "
-                        "Cross-group assignments were retained. "
-                        f"{same_group_count:,} same-group address conflict(s) "
-                        "were assigned once and added to the Overlap Audit "
-                        "for review."
-                    )
 
                 status_placeholder.info(random.choice([
                     "Analysis engine stops for coffee…",
