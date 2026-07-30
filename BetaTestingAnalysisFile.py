@@ -514,14 +514,30 @@ st.markdown(
     .territory-loading-message-3 { animation-delay: 15s; }
     .territory-guidance {
         padding: 0.65rem 0.8rem;
+        border: 1px solid color-mix(in srgb, var(--text-color) 18%, transparent);
         border-radius: 0.4rem;
-        background: rgba(128, 128, 128, 0.10);
-        color: rgba(49, 51, 63, 0.78);
+        background: var(--secondary-background-color);
+        color: var(--text-color);
         font-size: 0.9rem;
+        line-height: 1.45;
     }
     div[data-baseweb="tag"] {
-        background-color: rgba(128, 128, 128, 0.18) !important;
-        color: inherit !important;
+        background-color: color-mix(
+            in srgb,
+            var(--text-color) 18%,
+            var(--secondary-background-color)
+        ) !important;
+        color: var(--text-color) !important;
+        border-color: color-mix(
+            in srgb,
+            var(--text-color) 24%,
+            transparent
+        ) !important;
+    }
+    div[data-baseweb="tag"] span,
+    div[data-baseweb="tag"] svg {
+        color: var(--text-color) !important;
+        fill: currentColor !important;
     }
     div[data-testid="stDownloadButton"] button {
         background-color: #0D6B31 !important;
@@ -543,40 +559,47 @@ st.markdown(
 st.title("TerritoryToolbox's Analysis Engine")
 st.markdown("Upload your territories KML map to generate a complete, filtered address database & analysis.")
 
-st.sidebar.header("Step 1: Enter Your Analysis Details")
-congregation_name = st.sidebar.text_input(
-    "Congregation Name (No Spaces)",
-    "ExampleCongregation",
-)
-county_options = list(COUNTY_CONFIGS.keys())
-selected_counties = st.sidebar.multiselect(
-    "Counties Included in This Analysis",
-    options=county_options,
-    default=county_options[:1],
-)
-goal_range = st.sidebar.selectbox(
-    "Goal # of Addresses Per Territory",
-    ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
-    index=3,
-)
+st.header("Step 1: Enter Your Analysis Details")
+step1_col1, step1_col2 = st.columns(2)
+with step1_col1:
+    congregation_name = st.text_input(
+        "Congregation Name (No Spaces)",
+        "ExampleCongregation",
+    )
+with step1_col2:
+    county_options = list(COUNTY_CONFIGS.keys())
+    selected_counties = st.multiselect(
+        "Counties Included in This Analysis",
+        options=county_options,
+        default=county_options[:1],
+    )
+
+goal_col, advanced_col = st.columns(2)
+with goal_col:
+    goal_range = st.selectbox(
+        "Goal # of Addresses Per Territory",
+        ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
+        index=3,
+    )
 
 selected_excluded_statuses = {}
-with st.sidebar.expander("Advanced Settings"):
-    apartment_threshold = st.selectbox(
-        "Apartment Grouping Threshold",
-        [4, 5, 6],
-        index=1,
-    )
-    for county_name in selected_counties:
-        county_excluded_statuses = COUNTY_CONFIGS[county_name][
-            "excluded_statuses"
-        ]
-        selected_excluded_statuses[county_name] = st.multiselect(
-            f"{county_name} Excluded Audit Controls",
-            options=county_excluded_statuses,
-            default=county_excluded_statuses,
-            key=f"excluded_audit_controls_{county_name}",
+with advanced_col:
+    with st.expander("Advanced Settings"):
+        apartment_threshold = st.selectbox(
+            "Apartment Grouping Threshold",
+            [4, 5, 6],
+            index=1,
         )
+        for county_name in selected_counties:
+            county_excluded_statuses = COUNTY_CONFIGS[county_name][
+                "excluded_statuses"
+            ]
+            selected_excluded_statuses[county_name] = st.multiselect(
+                f"{county_name} Excluded Audit Controls",
+                options=county_excluded_statuses,
+                default=county_excluded_statuses,
+                key=f"excluded_audit_controls_{county_name}",
+            )
 
 st.header("Step 2: Upload Your Territory Map")
 uploaded_kml = st.file_uploader("Upload Territory KML File", type=["kml"])
@@ -594,11 +617,10 @@ if uploaded_kml:
         st.markdown(
             """
             <div class="territory-guidance">
-                For the most accurate results, consider uploading and analyzing
-                separate KML files for different territory categories, such as
-                Residential, Business, and Letter Writing. Combined KML files
-                are supported, but overlapping maps require the analysis engine
-                to apply assignment-priority rules.
+                Tip: Analyze your territory types (Residential, Business, Letter
+                Writing) using separate KML files. Combined files are supported,
+                but overlapping maps force the engine to prioritize where shared
+                addresses are assigned.
             </div>
             """,
             unsafe_allow_html=True,
@@ -4445,6 +4467,6 @@ if "excel_data" in st.session_state:
 
 st.markdown(
     "<div style='margin-top: 2rem;'><a href='https://territorytoolbox.com' "
-    "target='_self'>Back to TerritoryToolbox</a></div>",
+    "target='_blank' rel='noopener noreferrer'>Back to TerritoryToolbox</a></div>",
     unsafe_allow_html=True,
 )
