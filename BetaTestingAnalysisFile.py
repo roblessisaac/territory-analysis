@@ -9,24 +9,70 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 import fiona
 import io
 import datetime
+import hashlib
+import json
+import os
 import re
-import random
+import tempfile
+from pathlib import Path
 from fractions import Fraction
 from itertools import combinations
 
+import requests
 from shapely.geometry import box
 
-# Enable KML support in GeoPandas yippe!
-fiona.drvsupport.supported_drivers['KML'] = 'rw'
-fiona.drvsupport.supported_drivers['LIBKML'] = 'rw'
+# Enable KML support in GeoPandas.
+fiona.drvsupport.supported_drivers["KML"] = "rw"
+fiona.drvsupport.supported_drivers["LIBKML"] = "rw"
 
-COUNTY_CONFIGS = {
+st.set_page_config(
+    page_title="TerritoryToolbox's Analysis Engine",
+    layout="wide",
+)
+
+# --- CLOUDFLARE R2 RELEASE CONFIGURATION ---
+R2_PUBLIC_BASE_URL = "https://data.territorytoolbox.com"
+R2_RELEASE_POINTER_PATH = "current/release.json"
+R2_METADATA_CACHE_TTL_SECONDS = 600
+R2_DOWNLOAD_TIMEOUT_SECONDS = 120
+R2_BBOX_PADDING_DEGREES = 0.001
+R2_CACHE_DIRECTORY = Path(tempfile.gettempdir()) / "territorytoolbox_r2_cache"
+DEFAULT_STATE = "WI"
+DEFAULT_METRIC_CRS = "EPSG:3071"
+
+WISCONSIN_COUNTY_ORDER = (
+    "Adams", "Ashland", "Barron", "Bayfield", "Brown", "Buffalo",
+    "Burnett", "Calumet", "Chippewa", "Clark", "Columbia", "Crawford",
+    "Dane", "Dodge", "Door", "Douglas", "Dunn", "Eau Claire", "Florence",
+    "Fond du Lac", "Forest", "Grant", "Green", "Green Lake", "Iowa",
+    "Iron", "Jackson", "Jefferson", "Juneau", "Kenosha", "Kewaunee",
+    "La Crosse", "Lafayette", "Langlade", "Lincoln", "Manitowoc",
+    "Marathon", "Marinette", "Marquette", "Menominee", "Milwaukee",
+    "Monroe", "Oconto", "Oneida", "Outagamie", "Ozaukee", "Pepin",
+    "Pierce", "Polk", "Portage", "Price", "Racine", "Richland", "Rock",
+    "Rusk", "St. Croix", "Sauk", "Sawyer", "Shawano", "Sheboygan",
+    "Taylor", "Trempealeau", "Vernon", "Vilas", "Walworth", "Washburn",
+    "Washington", "Waukesha", "Waupaca", "Waushara", "Winnebago", "Wood",
+)
+
+# Milwaukee remains on its existing county-specific source. All other available
+# counties are determined dynamically from the active R2 manifest.
+COUNTY_OVERRIDE_CONFIGS = {
     "Milwaukee": {
         "file_path": "zip://data/Milwaukee_Datapoints07072026.zip",
         "state": "WI",
         "metric_crs": "EPSG:3071",
         "native_source_id": "TAXKEY",
         "excluded_statuses": [
+            "Undeveloped",
+            "Parking Lot",
+            "ROW",
+            "Park or Recreational Facility",
+            "Undeveloped Outlot",
+            "Sliver or Remnant",
+            "Non Addressable Assoc with Adj Parcel",
+        ],
+        "default_excluded_statuses": [
             "Undeveloped",
             "Parking Lot",
             "ROW",
@@ -48,33 +94,13 @@ COUNTY_CONFIGS = {
             "Addr_Statu": "Canonical_Status",
         },
     },
-    "Waukesha": {
-        "file_path": "zip://data/WAUKESHA_Shape_Address.zip",
-        "state": "WI",
-        "metric_crs": "EPSG:3071",
-        "native_source_id": "point_id",
-        "excluded_statuses": [
-            "Other",
-            "Utility Asset",
-            "Parcel",
-        ],
-        "column_mapping": {
-            "point_id": "Canonical_Native_Source_ID",
-            "site_numbe": "Canonical_HouseNo",
-            "addnum_suf": "Canonical_HouseSx",
-            "legprefixd": "Canonical_Dir",
-            "legroadnam": "Canonical_Street",
-            "legroadtyp": "Canonical_StType",
-            "legsuffixd": "Canonical_SuffixDir",
-            "post_comm": "Canonical_Muni",
-            "post_code": "Canonical_Zip_Code",
-            "unittype": "Canonical_UnitType",
-            "unitnumber": "Canonical_Unit",
-            "pointtype": "Canonical_Status",
-            "full_addre": "Canonical_Full_Address",
-        },
-    },
 }
+
+STATEWIDE_REVIEW_STATUS_OPTIONS = [
+    "Building Parent",
+    "Unknown Unit Address",
+]
+STATEWIDE_DEFAULT_REVIEW_EXCLUSIONS = ["Building Parent"]
 
 REQUIRED_CANONICAL_COLUMNS = [
     "Canonical_HouseNo", "Canonical_HouseSx", "Canonical_Dir", "Canonical_Street",
@@ -205,19 +231,222 @@ def normalize_county_prefix(county_name):
     ).strip("_")
 
 
-def validate_selected_counties(selected_counties):
-    """Return the common state and metric CRS for compatible counties."""
+def build_public_r2_url(relative_path):
+    """Build a public HTTPS URL without accepting private endpoints."""
+    clean_path = clean_field(relative_path).lstrip("/")
+    if not clean_path:
+        raise ValueError("The active data release contains an empty file path.")
+    return f"{R2_PUBLIC_BASE_URL}/{clean_path}"
+
+
+def _response_json(response, resource_name):
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise ValueError(
+            f"The {resource_name} response was not valid JSON."
+        ) from exc
+
+
+def _request_json(url, resource_name):
+    try:
+        response = requests.get(
+            url,
+            timeout=(15, R2_DOWNLOAD_TIMEOUT_SECONDS),
+            headers={"User-Agent": "TerritoryToolbox-Analyzer/1.0"},
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ConnectionError(
+            f"TerritoryToolbox could not load the {resource_name}. "
+            "Please retry in a few minutes."
+        ) from exc
+    return _response_json(response, resource_name)
+
+
+def validate_release_metadata(release):
+    if not isinstance(release, dict):
+        raise ValueError("The active release pointer has an invalid structure.")
+    required_fields = (
+        "release_version",
+        "release_status",
+        "manifest_path",
+        "runtime_base_path",
+        "runtime_schema_version",
+        "manifest_schema_version",
+    )
+    missing = [field for field in required_fields if not clean_field(release.get(field))]
+    if missing:
+        raise ValueError(
+            "The active release pointer is missing required fields: "
+            + ", ".join(missing)
+        )
+    if clean_field(release.get("release_status")).lower() != "complete":
+        raise ValueError("The active Wisconsin data release is not marked complete.")
+    return release
+
+
+@st.cache_data(ttl=R2_METADATA_CACHE_TTL_SECONDS, show_spinner=False)
+def load_active_release():
+    """Load and validate the stable current-release pointer."""
+    release_url = build_public_r2_url(R2_RELEASE_POINTER_PATH)
+    return validate_release_metadata(
+        _request_json(release_url, "active Wisconsin data release")
+    )
+
+
+def _manifest_rows(manifest):
+    if isinstance(manifest, dict):
+        rows = manifest.get("counties")
+    else:
+        rows = manifest
+    if not isinstance(rows, list):
+        raise ValueError("The county manifest does not contain a counties list.")
+    return rows
+
+
+def _as_manifest_bool(value):
+    if isinstance(value, bool):
+        return value
+    return clean_field(value).lower() in {"true", "1", "yes"}
+
+
+def validate_manifest(manifest, release):
+    rows = _manifest_rows(manifest)
+    required_fields = {
+        "canonical_county",
+        "technical_validation_status",
+        "production_source_status",
+        "public_availability_status",
+        "coverage_confidence_status",
+        "publication_eligible",
+        "analyzer_enabled",
+        "included_in_publish_package",
+        "published_runtime_relative_path",
+        "runtime_schema_version",
+    }
+    seen_counties = set()
+    for position, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError(f"County manifest row {position} is invalid.")
+        missing = required_fields.difference(row)
+        if missing:
+            raise ValueError(
+                f"County manifest row {position} is missing: "
+                + ", ".join(sorted(missing))
+            )
+        county_name = clean_field(row.get("canonical_county"))
+        if not county_name:
+            raise ValueError(f"County manifest row {position} has no county name.")
+        if county_name in seen_counties:
+            raise ValueError(f"The county manifest contains duplicate rows for {county_name}.")
+        seen_counties.add(county_name)
+
+        enabled = (
+            _as_manifest_bool(row.get("analyzer_enabled"))
+            and _as_manifest_bool(row.get("included_in_publish_package"))
+            and _as_manifest_bool(row.get("publication_eligible"))
+        )
+        if enabled:
+            if not clean_field(row.get("published_runtime_relative_path")):
+                raise ValueError(
+                    f"{county_name} is enabled but has no published runtime path."
+                )
+            if not clean_field(row.get("published_runtime_sha256")):
+                raise ValueError(
+                    f"{county_name} is enabled but has no published runtime hash."
+                )
+            if not row.get("published_runtime_byte_size"):
+                raise ValueError(
+                    f"{county_name} is enabled but has no published runtime size."
+                )
+            row_schema = clean_field(row.get("runtime_schema_version"))
+            release_schema = clean_field(release.get("runtime_schema_version"))
+            if row_schema and row_schema != release_schema:
+                raise ValueError(
+                    f"{county_name} runtime schema {row_schema} does not match "
+                    f"the active release schema {release_schema}."
+                )
+    return manifest
+
+
+@st.cache_data(ttl=R2_METADATA_CACHE_TTL_SECONDS, show_spinner=False)
+def load_county_manifest(release_version, manifest_path, runtime_schema_version):
+    """Load the release-specific manifest using cache identity from the release."""
+    release_stub = {
+        "runtime_schema_version": runtime_schema_version,
+    }
+    manifest_url = build_public_r2_url(manifest_path)
+    manifest = _request_json(manifest_url, "Wisconsin county manifest")
+    return validate_manifest(manifest, release_stub)
+
+
+def get_manifest_county_lookup(manifest):
+    return {
+        clean_field(row.get("canonical_county")): row
+        for row in _manifest_rows(manifest)
+    }
+
+
+def _manifest_row_is_enabled(row):
+    return bool(
+        row
+        and _as_manifest_bool(row.get("analyzer_enabled"))
+        and _as_manifest_bool(row.get("included_in_publish_package"))
+        and _as_manifest_bool(row.get("publication_eligible"))
+        and clean_field(row.get("published_runtime_relative_path"))
+    )
+
+
+def get_available_counties(manifest_lookup):
+    enabled = {
+        county_name
+        for county_name, row in manifest_lookup.items()
+        if _manifest_row_is_enabled(row)
+    }
+    enabled.update(COUNTY_OVERRIDE_CONFIGS)
+    return [county for county in WISCONSIN_COUNTY_ORDER if county in enabled]
+
+
+def get_county_source_strategy(county_name, manifest_lookup):
+    if county_name in COUNTY_OVERRIDE_CONFIGS:
+        return "county_override"
+    row = manifest_lookup.get(county_name)
+    if _manifest_row_is_enabled(row):
+        return "statewide_runtime"
+    raise ValueError(f"{county_name} County is not available in the active release.")
+
+
+def get_county_exclusion_settings(county_name, manifest_lookup):
+    strategy = get_county_source_strategy(county_name, manifest_lookup)
+    if strategy == "county_override":
+        config = COUNTY_OVERRIDE_CONFIGS[county_name]
+        return (
+            list(config.get("excluded_statuses", [])),
+            list(config.get("default_excluded_statuses", [])),
+        )
+    return (
+        list(STATEWIDE_REVIEW_STATUS_OPTIONS),
+        list(STATEWIDE_DEFAULT_REVIEW_EXCLUSIONS),
+    )
+
+
+def validate_selected_counties(selected_counties, manifest_lookup):
+    """Return one compatible state and metric CRS for selected sources."""
     if not selected_counties:
         raise ValueError("Select at least one county before generating an analysis.")
 
-    states = {
-        clean_field(COUNTY_CONFIGS[county_name]["state"]).upper()
-        for county_name in selected_counties
-    }
-    metric_crs_values = {
-        clean_field(COUNTY_CONFIGS[county_name]["metric_crs"]).upper()
-        for county_name in selected_counties
-    }
+    states = set()
+    metric_crs_values = set()
+    for county_name in selected_counties:
+        strategy = get_county_source_strategy(county_name, manifest_lookup)
+        if strategy == "county_override":
+            config = COUNTY_OVERRIDE_CONFIGS[county_name]
+            states.add(clean_field(config.get("state")).upper())
+            metric_crs_values.add(clean_field(config.get("metric_crs")).upper())
+        else:
+            states.add(DEFAULT_STATE)
+            metric_crs_values.add(DEFAULT_METRIC_CRS)
 
     if len(states) != 1:
         raise ValueError(
@@ -226,11 +455,412 @@ def validate_selected_counties(selected_counties):
         )
     if len(metric_crs_values) != 1:
         raise ValueError(
-            "The selected counties do not share one compatible analysis CRS. "
-            "Choose counties configured with the same metric CRS."
+            "The selected counties do not share one compatible analysis CRS."
         )
-
     return states.pop(), metric_crs_values.pop()
+
+
+def summarize_selected_county_confidence(selected_counties, manifest_lookup):
+    validated = []
+    provisional = []
+    overrides = []
+    confidence_by_county = {}
+    disclosure = ""
+
+    for county_name in selected_counties:
+        if county_name in COUNTY_OVERRIDE_CONFIGS:
+            overrides.append(county_name)
+            confidence_by_county[county_name] = "county_specific"
+            continue
+        row = manifest_lookup[county_name]
+        status = clean_field(row.get("coverage_confidence_status")).lower()
+        confidence_by_county[county_name] = status or "provisional"
+        if status == "validated":
+            validated.append(county_name)
+        else:
+            provisional.append(county_name)
+            if not disclosure:
+                disclosure = clean_field(row.get("confidence_disclosure"))
+
+    parts = []
+    if validated:
+        parts.append("Validated statewide coverage: " + ", ".join(validated))
+    if provisional:
+        parts.append("Provisional statewide coverage: " + ", ".join(provisional))
+    if overrides:
+        parts.append("County-specific source: " + ", ".join(overrides))
+    if provisional and not disclosure:
+        disclosure = (
+            "Provisional counties passed automated technical validation but "
+            "have not been independently compared with county-maintained sources."
+        )
+    return " | ".join(parts), disclosure, confidence_by_county
+
+
+def _safe_cache_component(value):
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", clean_field(value)).strip("_")
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(8 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_downloaded_file(path, county_name, expected_size, expected_sha256):
+    path = Path(path)
+    if not path.is_file():
+        raise IOError(f"{county_name} County runtime data was not saved correctly.")
+    if expected_size and path.stat().st_size != int(expected_size):
+        raise IOError(
+            f"{county_name} County runtime data failed its size verification."
+        )
+    if expected_sha256:
+        actual_hash = _sha256_file(path)
+        if actual_hash.lower() != clean_field(expected_sha256).lower():
+            raise IOError(
+                f"{county_name} County runtime data failed its integrity verification."
+            )
+    return path
+
+
+@st.cache_resource(show_spinner=False)
+def download_runtime_file(
+    release_version,
+    county_name,
+    relative_path,
+    expected_size,
+    expected_sha256,
+):
+    """Stream one versioned county file into a deterministic local cache."""
+    R2_CACHE_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    hash_prefix = clean_field(expected_sha256)[:16] or "nohash"
+    filename = (
+        f"{_safe_cache_component(release_version)}__"
+        f"{_safe_cache_component(county_name)}__{hash_prefix}.parquet"
+    )
+    destination = R2_CACHE_DIRECTORY / filename
+
+    if destination.exists():
+        try:
+            return str(
+                verify_downloaded_file(
+                    destination,
+                    county_name,
+                    expected_size,
+                    expected_sha256,
+                )
+            )
+        except IOError:
+            destination.unlink(missing_ok=True)
+
+    url = build_public_r2_url(relative_path)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.part"
+    )
+    temporary.unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    byte_count = 0
+    try:
+        with requests.get(
+            url,
+            stream=True,
+            timeout=(15, R2_DOWNLOAD_TIMEOUT_SECONDS),
+            headers={"User-Agent": "TerritoryToolbox-Analyzer/1.0"},
+        ) as response:
+            response.raise_for_status()
+            with temporary.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    byte_count += len(chunk)
+    except requests.RequestException as exc:
+        temporary.unlink(missing_ok=True)
+        raise ConnectionError(
+            f"TerritoryToolbox could not download {county_name} County data. "
+            "Please retry later or report the issue."
+        ) from exc
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise IOError(
+            f"TerritoryToolbox could not save {county_name} County data locally."
+        ) from exc
+
+    if expected_size and byte_count != int(expected_size):
+        temporary.unlink(missing_ok=True)
+        raise IOError(
+            f"{county_name} County runtime data failed its size verification."
+        )
+    if expected_sha256 and digest.hexdigest().lower() != clean_field(expected_sha256).lower():
+        temporary.unlink(missing_ok=True)
+        raise IOError(
+            f"{county_name} County runtime data failed its integrity verification."
+        )
+    os.replace(temporary, destination)
+    return str(destination)
+
+
+def get_county_runtime_file(release, county_row):
+    county_name = clean_field(county_row.get("canonical_county"))
+    return Path(
+        download_runtime_file(
+            clean_field(release.get("release_version")),
+            county_name,
+            clean_field(county_row.get("published_runtime_relative_path")),
+            int(county_row.get("published_runtime_byte_size") or 0),
+            clean_field(county_row.get("published_runtime_sha256")),
+        )
+    )
+
+
+def _padded_wgs84_bbox(kml_bounds, kml_crs):
+    envelope = gpd.GeoSeries([box(*kml_bounds)], crs=kml_crs)
+    if envelope.crs is None:
+        envelope = envelope.set_crs("EPSG:4326", allow_override=True)
+    envelope = envelope.to_crs("EPSG:4326")
+    minx, miny, maxx, maxy = envelope.total_bounds
+    return (
+        float(minx - R2_BBOX_PADDING_DEGREES),
+        float(miny - R2_BBOX_PADDING_DEGREES),
+        float(maxx + R2_BBOX_PADDING_DEGREES),
+        float(maxy + R2_BBOX_PADDING_DEGREES),
+    )
+
+
+def read_runtime_county_bbox(local_path, kml_bounds, kml_crs):
+    """Use GeoParquet bbox pushdown when available, with a safe fallback."""
+    read_bbox = _padded_wgs84_bbox(kml_bounds, kml_crs)
+    try:
+        frame = gpd.read_parquet(local_path, bbox=read_bbox)
+        bbox_pushdown_used = True
+    except Exception as exc:
+        message = str(exc).lower()
+        expected_bbox_failure = any(
+            token in message
+            for token in (
+                "bbox",
+                "covering",
+                "unexpected keyword",
+                "not supported",
+                "geoparquet 1.1",
+            )
+        ) or isinstance(exc, (TypeError, ValueError, NotImplementedError))
+        if not expected_bbox_failure:
+            raise
+        frame = gpd.read_parquet(local_path)
+        if frame.crs is None:
+            raise ValueError("The statewide runtime file has no CRS.")
+        frame_wgs84 = frame.to_crs("EPSG:4326")
+        frame = frame.loc[frame_wgs84.geometry.intersects(box(*read_bbox))].copy()
+        bbox_pushdown_used = False
+    if frame.crs is None:
+        raise ValueError("The statewide runtime file has no CRS.")
+    if frame.crs.to_epsg() != 4326:
+        frame = frame.to_crs("EPSG:4326")
+    return frame, bbox_pushdown_used
+
+
+def _ensure_internal_columns(frame):
+    defaults = {
+        "Canonical_HouseSx": "",
+        "Canonical_Dir": "",
+        "Canonical_StType": "",
+        "Canonical_SuffixDir": "",
+        "Canonical_UnitType": "",
+        "Canonical_Unit": "",
+        "Canonical_Full_Address": "",
+        "Canonical_Full_House_Number": "",
+        "Canonical_Full_Street": "",
+        "Canonical_Mailable_Address": "",
+        "Canonical_Subaddress": "",
+        "Canonical_Postal_City": "",
+        "Canonical_ZIP4": "",
+        "Canonical_Full_ZIP": "",
+        "Canonical_Quality_Flags": "",
+        "Canonical_Record_Role": "Standalone Address",
+        "Canonical_Occupancy_Category": "",
+        "Canonical_Occupancy_Confidence": "",
+        "Canonical_Occupancy_Reason": "",
+        "Canonical_Analyzer_Handling": "include_standard",
+        "Canonical_Exclusion_Category": "none",
+        "Canonical_Analyzer_Eligible": True,
+        "Potential_Parent_Record": False,
+        "Potential_Child_Record": False,
+        "Potential_Double_Count_Flag": False,
+    }
+    for column, default in defaults.items():
+        if column not in frame.columns:
+            frame[column] = default
+    return frame
+
+
+def normalize_statewide_runtime_source(county_name, county_gdf, analysis_crs):
+    """Normalize the stable statewide runtime contract for the legacy engine."""
+    frame = county_gdf.reset_index(drop=True).copy()
+    frame = _ensure_internal_columns(frame)
+    missing_columns = [
+        column for column in REQUIRED_CANONICAL_COLUMNS
+        if column not in frame.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"{county_name} County runtime data is missing required fields: "
+            + ", ".join(missing_columns)
+        )
+    if "Source_Record_ID" not in frame.columns:
+        raise ValueError(
+            f"{county_name} County runtime data has no stable Source_Record_ID."
+        )
+    if frame.crs is None:
+        raise ValueError(f"{county_name} County runtime data has no CRS.")
+
+    frame["geometry"] = frame.geometry.make_valid()
+    frame = frame[frame.geometry.notna() & ~frame.geometry.is_empty].copy()
+    frame["Source_County"] = county_name
+    frame["Source_State"] = frame.get(
+        "Canonical_State",
+        pd.Series(DEFAULT_STATE, index=frame.index),
+    ).map(clean_field).replace("", DEFAULT_STATE)
+
+    source_ids = frame["Source_Record_ID"].map(clean_field)
+    if source_ids.eq("").any() or not source_ids.is_unique:
+        raise ValueError(
+            f"{county_name} County runtime data contains blank or duplicate source IDs."
+        )
+    frame["Canonical_Analyzer_Eligible"] = frame[
+        "Canonical_Analyzer_Eligible"
+    ].fillna(False).astype(bool)
+    for boolean_column in (
+        "Potential_Parent_Record",
+        "Potential_Child_Record",
+        "Potential_Double_Count_Flag",
+    ):
+        frame[boolean_column] = frame[boolean_column].fillna(False).astype(bool)
+    return frame.to_crs(analysis_crs)
+
+
+@st.cache_data(show_spinner=False)
+def load_county_override_data(county_name, kml_bounds=None, kml_crs=None):
+    """Load the existing county-specific override with an early bbox filter."""
+    county_config = COUNTY_OVERRIDE_CONFIGS[county_name]
+    county_path = county_config["file_path"]
+    read_bbox = None
+    if kml_bounds and kml_crs:
+        try:
+            with fiona.open(county_path) as county_source:
+                source_crs = county_source.crs_wkt or county_source.crs
+            if source_crs:
+                kml_envelope = gpd.GeoSeries(
+                    [box(*kml_bounds)],
+                    crs=kml_crs,
+                ).to_crs(source_crs)
+                read_bbox = tuple(float(value) for value in kml_envelope.total_bounds)
+        except (ValueError, TypeError, fiona.errors.FionaError):
+            read_bbox = None
+    if read_bbox is None:
+        return gpd.read_file(county_path)
+    return gpd.read_file(county_path, bbox=read_bbox)
+
+
+def normalize_county_override_source(
+    county_name,
+    county_gdf,
+    analysis_crs,
+):
+    """Normalize Milwaukee's existing county-specific schema."""
+    county_config = COUNTY_OVERRIDE_CONFIGS[county_name]
+    frame = county_gdf.reset_index(drop=True).copy()
+    frame = frame.rename(columns=county_config["column_mapping"], errors="ignore")
+    frame = _ensure_internal_columns(frame)
+    missing_columns = [
+        column for column in REQUIRED_CANONICAL_COLUMNS
+        if column not in frame.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"{county_name} County data failed preflight validation. Missing "
+            "required canonical columns: " + ", ".join(missing_columns)
+        )
+    if frame.crs is None:
+        raise ValueError(f"{county_name} County data has no CRS.")
+
+    frame["geometry"] = frame.geometry.make_valid()
+    frame = frame[frame.geometry.notna() & ~frame.geometry.is_empty].copy()
+    frame["Source_County"] = county_name
+    frame["Source_State"] = county_config["state"]
+    frame["Canonical_Analyzer_Eligible"] = True
+
+    county_prefix = normalize_county_prefix(county_name)
+    fallback_ids = pd.Series(
+        [f"FALLBACK-{row_number:09d}" for row_number in range(1, len(frame) + 1)],
+        index=frame.index,
+        dtype="string",
+    )
+    native_ids = frame["Canonical_Native_Source_ID"].map(clean_field)
+    source_ids = native_ids.where(native_ids.ne(""), fallback_ids)
+    frame["Source_Record_ID"] = county_prefix + "-" + source_ids.astype(str)
+    duplicate_ids = frame["Source_Record_ID"].duplicated(keep=False)
+    if duplicate_ids.any():
+        duplicate_sequence = (frame.groupby("Source_Record_ID").cumcount() + 1).astype(str)
+        frame.loc[duplicate_ids, "Source_Record_ID"] = (
+            frame.loc[duplicate_ids, "Source_Record_ID"]
+            + "-DUP-"
+            + duplicate_sequence.loc[duplicate_ids]
+        )
+    return frame.to_crs(analysis_crs)
+
+
+def prepare_county_data(
+    county_name,
+    kml_bounds,
+    kml_crs,
+    analysis_crs,
+    release,
+    manifest_lookup,
+):
+    """Load only the selected county and normalize it to one internal schema."""
+    strategy = get_county_source_strategy(county_name, manifest_lookup)
+    if strategy == "county_override":
+        source = load_county_override_data(
+            county_name,
+            kml_bounds=kml_bounds,
+            kml_crs=kml_crs,
+        )
+        normalized = normalize_county_override_source(
+            county_name,
+            source,
+            analysis_crs,
+        )
+        source_description = f"{county_name} County-specific dataset"
+        return normalized, source_description, False
+
+    county_row = manifest_lookup[county_name]
+    local_path = get_county_runtime_file(release, county_row)
+    source, bbox_pushdown_used = read_runtime_county_bbox(
+        local_path,
+        kml_bounds,
+        kml_crs,
+    )
+    normalized = normalize_statewide_runtime_source(
+        county_name,
+        source,
+        analysis_crs,
+    )
+    confidence = clean_field(
+        county_row.get("coverage_confidence_status")
+    ).capitalize()
+    source_description = (
+        f"Wisconsin NG911 Runtime {release['release_version']} "
+        f"({confidence or 'Provisional'})"
+    )
+    return normalized, source_description, bbox_pushdown_used
 
 
 @st.cache_data
@@ -447,10 +1077,10 @@ def resolve_overlapping_assignments(
 def show_loading_status(placeholder, message=None):
     """Display a loading wheel with messages rotating every five seconds."""
     messages = [
-        "Analysis engine stops for coffee…",
-        "Analysis engine gets a new call…",
-        "Analysis engine makes a return visit…",
-        "Analysis engine stamps a letter…",
+        "Loading the active county data release…",
+        "Downloading selected county records…",
+        "Matching addresses to territory boundaries…",
+        "Building your analysis workbook…",
     ]
     if message in messages:
         start_index = messages.index(message)
@@ -473,7 +1103,6 @@ def show_loading_status(placeholder, message=None):
 
 
 # --- 1. CONFIGURATION & UI SETUP ---
-st.set_page_config(page_title="TerritoryToolbox's Analysis Engine", layout="wide")
 
 st.markdown(
     """
@@ -610,17 +1239,45 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+try:
+    active_release = load_active_release()
+    county_manifest = load_county_manifest(
+        active_release["release_version"],
+        active_release["manifest_path"],
+        active_release["runtime_schema_version"],
+    )
+    manifest_county_lookup = get_manifest_county_lookup(county_manifest)
+    county_options = get_available_counties(manifest_county_lookup)
+except Exception as metadata_error:
+    st.error(
+        "TerritoryToolbox could not load the current Wisconsin county data "
+        f"release. {metadata_error}"
+    )
+    st.stop()
+
 st.header("Step 1: Enter Your Analysis Details")
 congregation_name = st.text_input(
     "Congregation Name (No Spaces)",
     "ExampleCongregation",
 )
-county_options = list(COUNTY_CONFIGS.keys())
+default_counties = ["Milwaukee"] if "Milwaukee" in county_options else county_options[:1]
 selected_counties = st.multiselect(
     "Counties Included In This Analysis",
     options=county_options,
-    default=county_options[:1],
+    default=default_counties,
 )
+
+confidence_summary, confidence_disclosure, county_confidence_by_name = (
+    summarize_selected_county_confidence(
+        selected_counties,
+        manifest_county_lookup,
+    )
+)
+if confidence_summary:
+    st.caption(confidence_summary)
+if confidence_disclosure:
+    st.caption(confidence_disclosure)
+
 goal_range = st.selectbox(
     "Goal # of Addresses Per Territory",
     ["25-50", "50-75", "75-100", "100-125", "125-150", "150-175"],
@@ -635,13 +1292,16 @@ with st.expander("Advanced Settings"):
         index=1,
     )
     for county_name in selected_counties:
-        county_excluded_statuses = COUNTY_CONFIGS[county_name][
-            "excluded_statuses"
-        ]
+        county_excluded_statuses, county_default_exclusions = (
+            get_county_exclusion_settings(
+                county_name,
+                manifest_county_lookup,
+            )
+        )
         selected_excluded_statuses[county_name] = st.multiselect(
             f"{county_name} Excluded Audit Controls",
             options=county_excluded_statuses,
-            default=county_excluded_statuses,
+            default=county_default_exclusions,
             key=f"excluded_audit_controls_{county_name}",
         )
 
@@ -718,107 +1378,6 @@ exclusion_signature = tuple(
 )
 
 # --- 2. DATA LOADING & CACHING ---
-@st.cache_data(show_spinner=False)
-def load_county_data(county_name, kml_bounds=None, kml_crs=None):
-    """Load one county, using the KML extent as an early read filter."""
-    county_config = COUNTY_CONFIGS[county_name]
-    county_path = county_config["file_path"]
-    read_bbox = None
-
-    if kml_bounds and kml_crs:
-        try:
-            with fiona.open(county_path) as county_source:
-                source_crs = county_source.crs_wkt or county_source.crs
-            if source_crs:
-                kml_envelope = gpd.GeoSeries(
-                    [box(*kml_bounds)],
-                    crs=kml_crs,
-                ).to_crs(source_crs)
-                read_bbox = tuple(
-                    float(value) for value in kml_envelope.total_bounds
-                )
-        except (ValueError, TypeError, fiona.errors.FionaError):
-            read_bbox = None
-
-    if read_bbox is None:
-        return gpd.read_file(county_path)
-    return gpd.read_file(county_path, bbox=read_bbox)
-
-
-def prepare_county_data(
-    county_name,
-    kml_bounds,
-    kml_crs,
-    analysis_crs,
-):
-    """Normalize one county before it enters the combined address layer."""
-    county_config = COUNTY_CONFIGS[county_name]
-    county_gdf = load_county_data(
-        county_name,
-        kml_bounds=kml_bounds,
-        kml_crs=kml_crs,
-    )
-    county_gdf = county_gdf.reset_index(drop=True).copy()
-    county_gdf = county_gdf.rename(
-        columns=county_config["column_mapping"],
-        errors="ignore",
-    )
-
-    missing_columns = [
-        column
-        for column in REQUIRED_CANONICAL_COLUMNS
-        if column not in county_gdf.columns
-    ]
-    if missing_columns:
-        raise ValueError(
-            f"{county_name} County data failed preflight validation. Missing "
-            "required canonical columns: "
-            + ", ".join(missing_columns)
-        )
-    if county_gdf.crs is None:
-        raise ValueError(
-            f"{county_name} County data has no CRS. Assign the correct source "
-            "CRS before processing."
-        )
-
-    county_gdf["geometry"] = county_gdf.geometry.make_valid()
-    county_gdf = county_gdf[
-        county_gdf.geometry.notna() & ~county_gdf.geometry.is_empty
-    ].copy()
-    county_gdf["Source_County"] = county_name
-    county_gdf["Source_State"] = county_config["state"]
-
-    county_prefix = normalize_county_prefix(county_name)
-    fallback_ids = pd.Series(
-        [
-            f"FALLBACK-{row_number:09d}"
-            for row_number in range(1, len(county_gdf) + 1)
-        ],
-        index=county_gdf.index,
-        dtype="string",
-    )
-    native_id_col = "Canonical_Native_Source_ID"
-    if native_id_col in county_gdf.columns:
-        native_ids = county_gdf[native_id_col].map(clean_field)
-        source_ids = native_ids.where(native_ids.ne(""), fallback_ids)
-    else:
-        source_ids = fallback_ids
-
-    county_gdf["Source_Record_ID"] = (
-        county_prefix + "-" + source_ids.astype(str)
-    )
-    duplicate_ids = county_gdf["Source_Record_ID"].duplicated(keep=False)
-    if duplicate_ids.any():
-        duplicate_sequence = (
-            county_gdf.groupby("Source_Record_ID").cumcount() + 1
-        ).astype(str)
-        county_gdf.loc[duplicate_ids, "Source_Record_ID"] = (
-            county_gdf.loc[duplicate_ids, "Source_Record_ID"]
-            + "-DUP-"
-            + duplicate_sequence.loc[duplicate_ids]
-        )
-
-    return county_gdf.to_crs(analysis_crs)
 
 # --- ADDRESS BUILDER + NORMALIZATION HELPERS ---
 def normalize_house_number(value):
@@ -869,7 +1428,12 @@ def normalize_unit(value, unit_type=None):
 
 
 def combine_house_number(row):
-    house = normalize_house_number(row.get("Canonical_HouseNo"))
+    preferred_house = normalize_house_number(
+        row.get("Canonical_Full_House_Number")
+    )
+    house = preferred_house or normalize_house_number(
+        row.get("Canonical_HouseNo")
+    )
     suffix = clean_field(row.get("Canonical_HouseSx"))
 
     if not house or not suffix or house.upper().endswith(suffix.upper()):
@@ -879,6 +1443,9 @@ def combine_house_number(row):
 
 
 def build_canonical_street(row):
+    preferred_street = clean_field(row.get("Canonical_Full_Street"))
+    if preferred_street:
+        return preferred_street
     fields = [
         row.get("Canonical_Dir"),
         row.get("Canonical_Street"),
@@ -959,9 +1526,7 @@ def house_number_sort_parts(value):
 def build_addresses(row, state):
     full_house_number = combine_house_number(row)
     full_street = build_canonical_street(row)
-    parsed_is_usable = bool(
-        full_house_number and clean_field(row.get("Canonical_Street"))
-    )
+    parsed_is_usable = bool(full_house_number and full_street)
 
     fallback = normalize_full_address(row.get("Canonical_Full_Address"))
     fallback_line = fallback.split(",", 1)[0].strip()
@@ -972,14 +1537,21 @@ def build_addresses(row, state):
     else:
         base_line = " ".join([full_house_number, full_street]).strip()
 
-    municipality = clean_field(row.get("Canonical_Muni"))
-    normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
-    zip_code = normalized_zip[:5] if normalized_zip else ""
+    municipality = (
+        clean_field(row.get("Canonical_Postal_City"))
+        or clean_field(row.get("Canonical_Muni"))
+    )
+    preferred_zip = (
+        clean_field(row.get("Canonical_Full_ZIP"))
+        or clean_field(row.get("Canonical_Zip_Code"))
+    )
+    normalized_zip = normalize_zip_code(preferred_zip)
     locality = ", ".join(part for part in [municipality, state] if part)
-    if zip_code:
-        locality = f"{locality} {zip_code}".strip()
+    if normalized_zip:
+        locality = f"{locality} {normalized_zip}".strip()
 
-    unit = normalize_unit(
+    preferred_subaddress = clean_field(row.get("Canonical_Subaddress"))
+    unit = preferred_subaddress or normalize_unit(
         row.get("Canonical_Unit"),
         row.get("Canonical_UnitType"),
     )
@@ -988,6 +1560,12 @@ def build_addresses(row, state):
     mailable_address = ", ".join(
         part for part in [mailable_line, locality] if part
     )
+
+    preferred_mailable = normalize_full_address(
+        row.get("Canonical_Mailable_Address")
+    )
+    if preferred_mailable and is_usable_full_address(preferred_mailable):
+        mailable_address = preferred_mailable
 
     return pd.Series(
         [base_address, mailable_address],
@@ -1177,7 +1755,16 @@ def evaluate_data_quality(row):
     elif fallback and not parsed_is_usable:
         issues.append("Unusable Full Address Fallback")
 
-    return " | ".join(issues)
+    result = " | ".join(issues)
+    source_quality_flags = clean_field(row.get("Canonical_Quality_Flags"))
+    if source_quality_flags:
+        for source_flag in [
+            flag.strip()
+            for flag in source_quality_flags.split("|")
+            if flag.strip()
+        ]:
+            result = append_quality_flag(result, source_flag)
+    return result
 
 
 def parse_house_number_components(full_house_number):
@@ -1235,7 +1822,10 @@ def parse_mailable_address(row, state):
     state_zip = address_parts[2] if len(address_parts) > 2 else ""
 
     state_value = state
-    normalized_zip = normalize_zip_code(row.get("Canonical_Zip_Code"))
+    normalized_zip = normalize_zip_code(
+        clean_field(row.get("Canonical_Full_ZIP"))
+        or clean_field(row.get("Canonical_Zip_Code"))
+    )
     zip_code = normalized_zip[:5] if normalized_zip else ""
     zip4_code = normalized_zip.split("-", 1)[1] if "-" in normalized_zip else ""
     state_zip_match = re.fullmatch(
@@ -1249,7 +1839,7 @@ def parse_mailable_address(row, state):
 
     unit_type = ""
     unit_value = clean_field(row.get("Canonical_Unit"))
-    normalized_unit = normalize_unit(
+    normalized_unit = clean_field(row.get("Canonical_Subaddress")) or normalize_unit(
         unit_value,
         row.get("Canonical_UnitType"),
     )
@@ -1291,7 +1881,7 @@ def parse_mailable_address(row, state):
     suffix_direction = clean_field(
         row.get("Canonical_SuffixDir")
     ).upper()
-    full_street = " ".join(
+    full_street = clean_field(row.get("Canonical_Full_Street")) or " ".join(
         part
         for part in [
             street_prefix,
@@ -1432,6 +2022,17 @@ def generate_excel_report(
                 county_statuses
             )
         )
+
+    if "Canonical_Analyzer_Eligible" in joined_gdf.columns:
+        analyzer_eligible = joined_gdf[
+            "Canonical_Analyzer_Eligible"
+        ].fillna(True).astype(bool)
+        exclusion_mask |= ~analyzer_eligible
+    if "Potential_Double_Count_Flag" in joined_gdf.columns:
+        exclusion_mask |= joined_gdf[
+            "Potential_Double_Count_Flag"
+        ].fillna(False).astype(bool)
+
     excluded_gdf = joined_gdf[exclusion_mask].copy()
     valid_gdf = joined_gdf[~exclusion_mask].copy()
 
@@ -1597,7 +2198,14 @@ def generate_excel_report(
         excluded_gdf["NWS_Number"] = excluded_gdf["NWS_Number"].fillna("0")
 
     apartment_source = valid_gdf[
-        ["Territory_Name", "Base_Address", "Canonical_Unit"]
+        [
+            "Territory_Name",
+            "Base_Address",
+            "Canonical_Unit",
+            "Canonical_Occupancy_Category",
+            "Canonical_Occupancy_Confidence",
+            "Canonical_Occupancy_Reason",
+        ]
     ].copy()
     apartment_source["_Unit_Normalized"] = (
         apartment_source["Canonical_Unit"]
@@ -1606,12 +2214,39 @@ def generate_excel_report(
         .str.replace(r"\s+", " ", regex=True)
         .str.strip()
     )
+    apartment_source["_Occupancy_Category"] = apartment_source[
+        "Canonical_Occupancy_Category"
+    ].map(clean_field)
+    explicitly_nonresidential_categories = {
+        "Commercial Suite or Office",
+        "Hotel or Motel Room",
+        "Campground Site",
+        "Storage Unit",
+    }
+    apartment_source = apartment_source[
+        ~apartment_source["_Occupancy_Category"].isin(
+            explicitly_nonresidential_categories
+        )
+    ].copy()
     apartment_source = apartment_source[
         apartment_source["Base_Address"].map(clean_field).ne("")
     ].copy()
     apartment_source["_Has_Nonblank_Unit"] = apartment_source[
         "_Unit_Normalized"
     ].ne("")
+    apartment_source["_Explicit_Residential_Occupancy"] = apartment_source[
+        "_Occupancy_Category"
+    ].isin(
+        {
+            "Residential Apartment or Condominium",
+            "Residential Side or Duplex Unit",
+            "Dormitory Room",
+            "Mobile-home or Trailer Site",
+        }
+    )
+    apartment_source["_Unknown_Occupancy"] = apartment_source[
+        "_Occupancy_Category"
+    ].isin({"", "Unknown Unit or Subaddress"})
 
     apt_groups = (
         apartment_source.groupby(
@@ -1625,6 +2260,14 @@ def generate_excel_report(
                 "Unique Normalized Units": (
                     "_Unit_Normalized",
                     lambda values: values[values.ne("")].nunique(),
+                ),
+                "_Explicit Residential Evidence": (
+                    "_Explicit_Residential_Occupancy",
+                    "max",
+                ),
+                "_Unknown Occupancy Evidence": (
+                    "_Unknown_Occupancy",
+                    "max",
                 ),
             }
         )
@@ -1643,7 +2286,11 @@ def generate_excel_report(
     def get_apartment_confidence(row):
         if row["Unique Normalized Units"] < apt_threshold:
             return "Below Threshold"
-        if row["Duplicate Units"] == 0 and row["Blank Parent Rows"] <= 1:
+        if (
+            bool(row["_Explicit Residential Evidence"])
+            and row["Duplicate Units"] == 0
+            and row["Blank Parent Rows"] <= 1
+        ):
             return "High"
         if row["Duplicate Units"] <= 2:
             return "Medium"
@@ -1653,11 +2300,20 @@ def generate_excel_report(
         get_apartment_confidence,
         axis=1,
     )
-    apt_groups["Detection Reason"] = apt_groups.apply(
-        lambda row: (
+    def get_apartment_detection_reason(row):
+        if bool(row["_Explicit Residential Evidence"]):
+            evidence = "explicit residential occupancy evidence"
+        elif bool(row["_Unknown Occupancy Evidence"]):
+            evidence = "unit evidence with unresolved occupancy classification"
+        else:
+            evidence = "county unit evidence"
+        return (
             f"{int(row['Unique Normalized Units'])} unique nonblank unit "
-            f"identifier(s) met the threshold of {apt_threshold}."
-        ),
+            f"identifier(s) met the threshold of {apt_threshold}; {evidence}."
+        )
+
+    apt_groups["Detection Reason"] = apt_groups.apply(
+        get_apartment_detection_reason,
         axis=1,
     )
     apt_groups = apt_groups[
@@ -1985,8 +2641,29 @@ def generate_excel_report(
             cross_county_duplicate_df
         )
 
+        release_version = clean_field(
+            analysis_config.get("release_version")
+        )
+        runtime_schema_version = clean_field(
+            analysis_config.get("runtime_schema_version")
+        )
+        manifest_schema_version = clean_field(
+            analysis_config.get("manifest_schema_version")
+        )
+        county_confidence_summary = clean_field(
+            analysis_config.get("county_confidence_summary")
+        )
+        county_confidence_disclosure = clean_field(
+            analysis_config.get("county_confidence_disclosure")
+        )
+
         tech_info = [
             ("Run Timestamp", run_timestamp.strftime("%Y-%m-%d %H:%M")),
+            ("Wisconsin NG911 Runtime Release", release_version),
+            ("Runtime Schema Version", runtime_schema_version),
+            ("Manifest Schema Version", manifest_schema_version),
+            ("County Coverage Confidence", county_confidence_summary),
+            ("Coverage Disclosure", county_confidence_disclosure or "Not applicable"),
             ("Ideal Address Range Setting", f"{min_goal}-{max_goal} addresses"),
             ("Apartment Grouping Threshold", f"{apt_threshold} units"),
             ("Counties Included", ", ".join(selected_counties)),
@@ -2026,6 +2703,10 @@ def generate_excel_report(
             ("Records Flagged with Warnings", f"{flagged_record_count:,}"),
             ("KML Filename", kml_filename),
             ("County Source Files", county_source_summary),
+            (
+                "County Spatial Read Method",
+                clean_field(analysis_config.get("bbox_read_summary")),
+            ),
             (
                 "Possible Cross-County Duplicate Pairs",
                 f"{possible_cross_county_duplicate_pairs:,}",
@@ -3776,12 +4457,35 @@ def generate_excel_report(
 
         if not excluded_gdf.empty:
             excluded_audit = excluded_gdf.copy()
-            excluded_audit["Exclusion Explanation"] = excluded_audit.apply(
-                lambda row: (
+            def build_exclusion_explanation(row):
+                if bool(row.get("Potential_Double_Count_Flag", False)):
+                    return (
+                        "Excluded from territory counts to avoid parent-building "
+                        "and child-unit double counting. The record is retained "
+                        "for audit review."
+                    )
+                if not bool(row.get("Canonical_Analyzer_Eligible", True)):
+                    category = clean_field(
+                        row.get("Canonical_Exclusion_Category")
+                    ).replace("_", " ")
+                    handling = clean_field(
+                        row.get("Canonical_Analyzer_Handling")
+                    ).replace("_", " ")
+                    reason = category or handling or clean_field(
+                        row.get("Canonical_Status")
+                    )
+                    return (
+                        "Excluded by the statewide runtime classification: "
+                        f"{reason}."
+                    )
+                return (
                     f"Excluded due to {clean_field(row.get('Source_County'))} "
                     "category: "
                     f"{clean_field(row.get('Canonical_Status')).upper()}"
-                ),
+                )
+
+            excluded_audit["Exclusion Explanation"] = excluded_audit.apply(
+                build_exclusion_explanation,
                 axis=1,
             )
             audit_frames.append(excluded_audit)
@@ -4246,6 +4950,9 @@ settings_signature = (
     congregation_name,
     goal_range,
     apartment_threshold,
+    active_release["release_version"],
+    active_release["runtime_schema_version"],
+    active_release["manifest_schema_version"],
 )
 
 inputs_changed = (
@@ -4270,16 +4977,27 @@ if uploaded_kml and "excel_data" not in st.session_state:
         status_placeholder = st.empty()
         show_loading_status(
             status_placeholder,
-            "Analysis engine stops for coffee…",
+            "Loading the active county data release…",
         )
 
         try:
             analysis_state, analysis_crs = validate_selected_counties(
-                selected_counties
+                selected_counties,
+                manifest_county_lookup,
             )
             analysis_config = {
                 "state": analysis_state,
                 "metric_crs": analysis_crs,
+                "release_version": active_release["release_version"],
+                "runtime_schema_version": active_release[
+                    "runtime_schema_version"
+                ],
+                "manifest_schema_version": active_release[
+                    "manifest_schema_version"
+                ],
+                "county_confidence_summary": confidence_summary,
+                "county_confidence_disclosure": confidence_disclosure,
+                "county_confidence_by_name": county_confidence_by_name,
             }
 
             kml_gdf = gpd.read_file(
@@ -4312,18 +5030,32 @@ if uploaded_kml and "excel_data" not in st.session_state:
             county_record_counts = {}
             county_source_files = {}
 
+            bbox_pushdown_by_county = {}
             for county_name in selected_counties:
                 show_loading_status(status_placeholder)
-                county_gdf = prepare_county_data(
-                    county_name=county_name,
-                    kml_bounds=kml_bounds,
-                    kml_crs=kml_crs,
-                    analysis_crs=analysis_crs,
-                )
+                try:
+                    county_gdf, source_description, bbox_pushdown_used = (
+                        prepare_county_data(
+                            county_name=county_name,
+                            kml_bounds=kml_bounds,
+                            kml_crs=kml_crs,
+                            analysis_crs=analysis_crs,
+                            release=active_release,
+                            manifest_lookup=manifest_county_lookup,
+                        )
+                    )
+                except Exception as county_error:
+                    print(
+                        f"County load failure for {county_name}: "
+                        f"{type(county_error).__name__}: {county_error}"
+                    )
+                    raise RuntimeError(
+                        f"{county_name} County data could not be loaded or "
+                        "validated. Please retry later or report the issue."
+                    ) from None
                 county_record_counts[county_name] = len(county_gdf)
-                county_source_files[county_name] = COUNTY_CONFIGS[
-                    county_name
-                ]["file_path"]
+                county_source_files[county_name] = source_description
+                bbox_pushdown_by_county[county_name] = bbox_pushdown_used
                 county_frames.append(county_gdf)
 
             if not county_frames:
@@ -4457,6 +5189,28 @@ if uploaded_kml and "excel_data" not in st.session_state:
             )
 
             show_loading_status(status_placeholder)
+
+            bbox_read_summary_parts = []
+            for county_name in selected_counties:
+                strategy = get_county_source_strategy(
+                    county_name,
+                    manifest_county_lookup,
+                )
+                if strategy == "county_override":
+                    bbox_read_summary_parts.append(
+                        f"{county_name}: county-source bbox filter"
+                    )
+                elif bbox_pushdown_by_county.get(county_name):
+                    bbox_read_summary_parts.append(
+                        f"{county_name}: GeoParquet bbox pushdown"
+                    )
+                else:
+                    bbox_read_summary_parts.append(
+                        f"{county_name}: safe full-read fallback"
+                    )
+            analysis_config["bbox_read_summary"] = " | ".join(
+                bbox_read_summary_parts
+            )
 
             excel_file = generate_excel_report(
                 joined_gdf,
