@@ -803,7 +803,10 @@ def normalize_county_override_source(
         index=frame.index,
         dtype="string",
     )
-    native_ids = frame["Canonical_Native_Source_ID"].map(clean_field)
+    native_ids = frame.get(
+        "Canonical_Native_Source_ID",
+        pd.Series("", index=frame.index),
+    ).map(clean_field)
     source_ids = native_ids.where(native_ids.ne(""), fallback_ids)
     frame["Source_Record_ID"] = county_prefix + "-" + source_ids.astype(str)
     duplicate_ids = frame["Source_Record_ID"].duplicated(keep=False)
