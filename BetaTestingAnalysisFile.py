@@ -5045,14 +5045,10 @@ if uploaded_kml and "excel_data" not in st.session_state:
                         )
                     )
                 except Exception as county_error:
-                    print(
-                        f"County load failure for {county_name}: "
-                        f"{type(county_error).__name__}: {county_error}"
-                    )
                     raise RuntimeError(
-                        f"{county_name} County data could not be loaded or "
-                        "validated. Please retry later or report the issue."
-                    ) from None
+                        f"{county_name} County load failure: "
+                        f"{type(county_error).__name__}: {county_error}"
+                    ) from county_error
                 county_record_counts[county_name] = len(county_gdf)
                 county_source_files[county_name] = source_description
                 bbox_pushdown_by_county[county_name] = bbox_pushdown_used
