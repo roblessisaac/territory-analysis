@@ -55,6 +55,15 @@ WISCONSIN_COUNTY_ORDER = (
     "Washington", "Waukesha", "Waupaca", "Waushara", "Winnebago", "Wood",
 )
 
+# Temporarily disabled after the statewide municipal coverage audit. Restore
+# these counties only after their data is corrected and revalidated.
+TEMPORARILY_DISABLED_COUNTIES = {
+    "Ashland",
+    "Dane",
+    "Ozaukee",
+    "Washington",
+}
+
 # Milwaukee remains on its existing county-specific source. All other available
 # counties are determined dynamically from the active R2 manifest.
 COUNTY_OVERRIDE_CONFIGS = {
@@ -405,10 +414,20 @@ def get_available_counties(manifest_lookup):
         if _manifest_row_is_enabled(row)
     }
     enabled.update(COUNTY_OVERRIDE_CONFIGS)
-    return [county for county in WISCONSIN_COUNTY_ORDER if county in enabled]
+    return [
+        county
+        for county in WISCONSIN_COUNTY_ORDER
+        if county in enabled
+        and county not in TEMPORARILY_DISABLED_COUNTIES
+    ]
 
 
 def get_county_source_strategy(county_name, manifest_lookup):
+    if county_name in TEMPORARILY_DISABLED_COUNTIES:
+        raise ValueError(
+            f"{county_name} County is temporarily unavailable while its "
+            "address coverage is being reviewed."
+        )
     if county_name in COUNTY_OVERRIDE_CONFIGS:
         return "county_override"
     row = manifest_lookup.get(county_name)
@@ -1263,11 +1282,29 @@ congregation_name = st.text_input(
     "Congregation Name (No Spaces)",
     "ExampleCongregation",
 )
-default_counties = ["Milwaukee"] if "Milwaukee" in county_options else county_options[:1]
+default_counties = (
+    ["Milwaukee"]
+    if "Milwaukee" in county_options
+    else county_options[:1]
+)
+county_multiselect_key = "territorytoolbox_selected_counties"
+if county_multiselect_key in st.session_state:
+    saved_counties = st.session_state[county_multiselect_key]
+    if not isinstance(saved_counties, list):
+        saved_counties = list(saved_counties) if saved_counties else []
+    sanitized_counties = [
+        county_name
+        for county_name in saved_counties
+        if county_name in county_options
+    ]
+    if sanitized_counties != saved_counties:
+        st.session_state[county_multiselect_key] = sanitized_counties
+
 selected_counties = st.multiselect(
     "Counties Included In This Analysis",
     options=county_options,
     default=default_counties,
+    key=county_multiselect_key,
 )
 
 confidence_summary, confidence_disclosure, county_confidence_by_name = (
